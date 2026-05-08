@@ -1,0 +1,31 @@
+name: hermes-tlon
+label: Tlon
+kind: platform
+version: 0.1.0
+description: Tlon/Urbit messenger gateway adapter
+requires_env:
+  - name: TLON_SHIP_URL
+    description: "HTTP URL of your Urbit ship (e.g. https://your-ship.tlon.network)"
+    prompt: "Ship URL"
+    password: false
+  - name: TLON_SHIP
+    description: "Your Urbit ship name (e.g. ~sampel-palnet)"
+    prompt: "Ship name"
+    password: false
+  - name: TLON_LOGIN_CODE
+    description: "Login code for the Tlon ship (e.g. lidlut-tabwed-pillex-ridrup)"
+    prompt: "Login code"
+    password: true
+optional_env:
+  - name: TLON_HOME_CHANNEL
+    description: "Default channel for cron delivery (e.g. ~host-ship/channel-name)"
+    password: false
+  - name: TLON_OWNER_SHIP
+    description: "Owner ship always allowed — receives approval DMs (e.g. ~your-main-ship)"
+    password: false
+  - name: TLON_ALLOWED_USERS
+    description: "Comma-separated list of ships allowed to DM the bot"
+    password: false
+  - name: TLON_ALLOW_ALL_USERS
+    description: "Set to 1 to allow all ships to DM the bot"
+    password: false
