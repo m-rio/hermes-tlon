@@ -18,6 +18,8 @@ References:
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 import uuid
 from typing import AsyncIterator, Callable, Dict, List, Optional
@@ -73,31 +75,117 @@ def make_msg_id(ship: str, sent_ms: int) -> str:
 # Story helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Markdown → Tlon inline parser
+# ---------------------------------------------------------------------------
+
+# Inline markdown token regex (precedence: longest/most-specific first)
+_MD_INLINE_RE = re.compile(
+    r'\*\*\*(.+?)\*\*\*'              # group 1 : ***bold-italic***
+    r'|\*\*(.+?)\*\*'                 # group 2 : **bold**
+    r'|__(.+?)__'                     # group 3 : __bold__
+    r'|\*([^*\n]+?)\*'                # group 4 : *italic*
+    r'|_([^\s_][^_\n]*?[^\s_]|[^\s_])_'  # group 5 : _italic_
+    r'|~~(.+?)~~'                     # group 6 : ~~strike~~
+    r'|`([^`\n]+)`'                   # group 7 : `inline code`
+    r'|\[([^\]\n]+)\]\(([^)\s]+)\)',  # groups 8,9: [text](url)
+    re.DOTALL,
+)
+
+# Fenced code block (``` … ```)
+_CODE_FENCE_RE = re.compile(r'^```[^\n]*$')
+
+# ATX heading (# … ###### at start of a line)
+_HEADING_RE = re.compile(r'^#{1,6}\s+(.*)')
+
+
+def _parse_inline_md(text: str) -> list:
+    """Recursively parse inline markdown into Tlon inline elements."""
+    result: list = []
+    last = 0
+    for m in _MD_INLINE_RE.finditer(text):
+        if m.start() > last:
+            result.append(text[last:m.start()])
+        g = m.groups()
+        if g[0]:                        # ***bold italic***
+            result.append({"bold": [{"italics": _parse_inline_md(g[0])}]})
+        elif g[1] or g[2]:             # **bold** / __bold__
+            result.append({"bold": _parse_inline_md(g[1] or g[2])})
+        elif g[3] or g[4]:             # *italic* / _italic_
+            result.append({"italics": _parse_inline_md(g[3] or g[4])})
+        elif g[5]:                     # ~~strike~~
+            result.append({"strike": _parse_inline_md(g[5])})
+        elif g[6]:                     # `code`
+            result.append({"inline-code": g[6]})
+        elif g[7]:                     # [text](url)
+            result.append({"link": {"href": g[8], "content": g[7]}})
+        last = m.end()
+    if last < len(text):
+        result.append(text[last:])
+    return result or [""]
+
+
 def text_to_story(text: str) -> list:
-    """Convert plain text to a minimal Tlon story (list of verse objects).
+    """Convert markdown text to a Tlon story (list of verse objects).
 
-    A story is a list of verses; the simplest form is a single inline verse
-    wrapping the text as a plain string inline element.
-
-    Structure: [{"inline": ["text content"]}]
+    Supported markdown:
+      **bold** / __bold__        → {bold: [...]}
+      *italic* / _italic_        → {italics: [...]}
+      ***bold-italic***          → {bold: [{italics: [...]}]}
+      ~~strike~~                 → {strike: [...]}
+      `inline code`              → {"inline-code": "..."}
+      [text](url)                → {link: {href, content}}
+      ```...``` fenced blocks    → each line as {"inline-code": line}
+      # Heading                  → {bold: [...]} on its own verse
+      Blank lines                → blank inline (paragraph separator)
     """
     if not text:
         return [{"inline": [""]}]
 
-    verses = []
+    verses: list = []
+    in_code_block = False
+    code_buf: list[str] = []
+
     for line in text.split("\n"):
-        if line:
-            verses.append({"inline": [line]})
-        else:
-            # Empty line → blank inline (preserves paragraph breaks)
+        # Fenced code block toggle
+        if _CODE_FENCE_RE.match(line):
+            if in_code_block:
+                # Emit the collected block as a multi-line inline-code element
+                if code_buf:
+                    verses.append({"inline": [{"inline-code": "\n".join(code_buf)}]})
+                code_buf = []
+                in_code_block = False
+            else:
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            code_buf.append(line)
+            continue
+
+        if not line:
             verses.append({"inline": [""]})
-    return verses
+            continue
+
+        # ATX heading → bold text
+        h = _HEADING_RE.match(line)
+        if h:
+            verses.append({"inline": [{"bold": _parse_inline_md(h.group(1))}]})
+            continue
+
+        verses.append({"inline": _parse_inline_md(line)})
+
+    # Unclosed code fence
+    if code_buf:
+        verses.append({"inline": [{"inline-code": "\n".join(code_buf)}]})
+
+    return verses or [{"inline": [""]}]
 
 
 def story_to_text(story: list) -> str:
     """Extract plain text from a Tlon story (list of verse objects).
 
-    Handles the common inline types.  Unrecognised structures are skipped
+    Handles common inline types.  Unrecognised structures are skipped
     silently so we don't crash on rich content.
     """
     parts: list[str] = []
@@ -111,10 +199,15 @@ def story_to_text(story: list) -> str:
             return node["text"]
         if "bold" in node:
             return "".join(_inline(i) for i in node["bold"])
-        if "italic" in node:
+        if "italics" in node:
+            return "".join(_inline(i) for i in node["italics"])
+        if "italic" in node:  # legacy compat
             return "".join(_inline(i) for i in node["italic"])
         if "strike" in node:
             return "".join(_inline(i) for i in node["strike"])
+        # "inline-code" is the canonical Tlon key; "code" kept for compat
+        if "inline-code" in node:
+            return node["inline-code"]
         if "code" in node:
             return node["code"]
         if "link" in node:
@@ -133,7 +226,7 @@ def story_to_text(story: list) -> str:
             continue
         if "inline" in verse:
             parts.append("".join(_inline(i) for i in verse["inline"]))
-        # block verses (images, code blocks, etc.) are ignored for plain text
+        # block verses (images, code blocks, etc.) — ignored for plain text
 
     return "\n".join(parts)
 
@@ -159,8 +252,10 @@ class UrbitClient:
         await client.close()
     """
 
-    # Ack every N events to keep the SSE channel healthy (mirrors openclaw)
-    _ACK_THRESHOLD = 20
+    # Ack every N events to keep the SSE channel healthy (mirrors openclaw).
+    # Low value (1 = every event) prevents Eyre's unacked-event buffer from
+    # filling up and triggering a %quit that silently kills subscriptions.
+    _ACK_THRESHOLD = 1
 
     def __init__(self, ship_url: str, ship: str, login_code: str):
         self.ship_url = ship_url.rstrip("/")
@@ -181,6 +276,11 @@ class UrbitClient:
         self._sub_handlers: Dict[int, Callable] = {}
         self._next_sub_id: int = 1
 
+        # Persistent subscription params for reconnect replay
+        # Each entry: {"app": str, "path": str, "on_event": Callable|None,
+        #              "on_err": Callable|None, "on_quit": Callable|None}
+        self._subscription_params: List[Dict] = []
+
         # SSE reader task
         self._sse_task: Optional[asyncio.Task] = None
         self._sse_closed: bool = False
@@ -191,6 +291,15 @@ class UrbitClient:
 
         # Reconnect state
         self._reconnect_delay: float = 1.0
+
+        # Keepalive
+        # Poke the ship every _KEEPALIVE_INTERVAL seconds so the SSE stream
+        # always has traffic.  If no bytes arrive for _SSE_READ_TIMEOUT seconds
+        # (> interval) we treat the stream as silently dead and reconnect.
+        _ka_env = int(os.environ.get("TLON_KEEPALIVE_INTERVAL", "180"))
+        self._KEEPALIVE_INTERVAL: float = max(30.0, float(_ka_env))
+        self._SSE_READ_TIMEOUT: float = self._KEEPALIVE_INTERVAL * 2.5
+        self._keepalive_task: Optional[asyncio.Task] = None
 
     # ── Session / auth ────────────────────────────────────────────────────
 
@@ -283,6 +392,12 @@ class UrbitClient:
         if on_event is not None:
             self._sub_handlers[sub_id] = on_event
 
+        # Remember params so we can replay after a reconnect
+        self._subscription_params.append({
+            "app": app, "path": path,
+            "on_event": on_event, "on_err": on_err, "on_quit": on_quit,
+        })
+
         payload = [{
             "id": sub_id,
             "action": "subscribe",
@@ -329,11 +444,12 @@ class UrbitClient:
     # ── SSE stream ────────────────────────────────────────────────────────
 
     async def open_sse_stream(self) -> None:
-        """Start the background SSE reader task."""
+        """Start the background SSE reader task and keepalive task."""
         if self._sse_task and not self._sse_task.done():
             return
         self._sse_closed = False
         self._sse_task = asyncio.create_task(self._sse_loop())
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def _sse_loop(self) -> None:
         """Background task: reads the SSE stream and dispatches events."""
@@ -361,26 +477,66 @@ class UrbitClient:
 
         logger.info("Tlon: SSE loop exited")
 
+    async def _keepalive_loop(self) -> None:
+        """Periodically poke the ship to keep the SSE channel alive.
+
+        Urbit ships can silently stop sending SSE events after a long idle
+        period.  Sending a helm-hi poke every _KEEPALIVE_INTERVAL seconds
+        guarantees at least one SSE event (the poke ack) per interval, so
+        the read-timeout in _read_sse_stream can detect true dead connections.
+        """
+        await asyncio.sleep(self._KEEPALIVE_INTERVAL)
+        while not self._sse_closed:
+            if self._channel_url and self._authenticated:
+                try:
+                    wake = [{
+                        "id": self._next_id(),
+                        "action": "poke",
+                        "ship": self._ship_no_tilde,
+                        "app": "hood",
+                        "mark": "helm-hi",
+                        "json": "hermes-tlon keepalive",
+                    }]
+                    await self._put_channel(wake, context="keepalive")
+                    logger.debug("Tlon: keepalive poke sent")
+                except Exception as exc:
+                    logger.warning("Tlon: keepalive poke failed: %s", exc)
+            try:
+                await asyncio.sleep(self._KEEPALIVE_INTERVAL)
+            except asyncio.CancelledError:
+                break
+
     async def _read_sse_stream(self) -> None:
-        """Open the GET SSE stream and read until disconnected."""
+        """Open the GET SSE stream and read until disconnected or timed out."""
         session = await self._ensure_session()
         logger.info("Tlon: opening SSE stream on %s", self._channel_url)
 
         async with session.get(
             self._channel_url,
             headers={"Accept": "text/event-stream"},
-            timeout=aiohttp.ClientTimeout(sock_read=None),  # stream — no read timeout
+            timeout=aiohttp.ClientTimeout(sock_read=None),  # outer: no hard limit
         ) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"SSE GET returned HTTP {resp.status}")
 
             self._reconnect_delay = 1.0  # reset on successful connection
-            logger.info("Tlon: SSE stream connected")
+            logger.info("Tlon: SSE stream connected (idle timeout=%.0fs, keepalive=%.0fs)",
+                        self._SSE_READ_TIMEOUT, self._KEEPALIVE_INTERVAL)
 
             buf = ""
-            async for chunk in resp.content.iter_chunked(4096):
-                if self._sse_closed:
-                    break
+            while not self._sse_closed:
+                try:
+                    chunk = await asyncio.wait_for(
+                        resp.content.read(4096),
+                        timeout=self._SSE_READ_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"SSE stream idle for >{self._SSE_READ_TIMEOUT:.0f}s — "
+                        "assuming silent disconnect"
+                    )
+                if not chunk:
+                    raise RuntimeError("SSE stream closed by server (empty read)")
                 buf += chunk.decode("utf-8", errors="replace")
                 while "\n\n" in buf:
                     raw_event, buf = buf.split("\n\n", 1)
@@ -427,7 +583,8 @@ class UrbitClient:
 
         if resp_type == "quit":
             sub_id = parsed.get("id")
-            logger.warning("Tlon: subscription %s quit — will resubscribe", sub_id)
+            logger.warning("Tlon: subscription %s quit — scheduling resubscription", sub_id)
+            asyncio.create_task(self._reconnect_after_quit())
             return
 
         # Subscription event — route to registered handler
@@ -457,12 +614,60 @@ class UrbitClient:
     # ── Re-subscribe after reconnect ──────────────────────────────────────
 
     async def _resubscribe_all(self) -> None:
-        """Re-send all active subscriptions after a channel reconnect."""
-        # Subscriptions are stored per-id; we need the app+path to re-subscribe.
-        # For simplicity in Phase 2 (DM only), the adapter re-calls subscribe()
-        # by closing and reopening the adapter.  This is handled in the adapter's
-        # _listen_loop reconnect logic.
-        pass
+        """Re-send all active subscriptions after a channel reconnect.
+
+        Clears the handler map and re-issues each stored subscription so the
+        new channel receives the correct sub_ids → handler mappings.
+        """
+        if not self._subscription_params:
+            return
+
+        # Clear stale id→handler mapping; new sub_ids will be assigned below
+        self._sub_handlers.clear()
+
+        # Snapshot the list and clear it so subscribe() can repopulate it
+        # without duplicating entries.
+        params_snapshot = list(self._subscription_params)
+        self._subscription_params.clear()
+
+        logger.info("Tlon: re-subscribing %d subscription(s) after reconnect",
+                    len(params_snapshot))
+        for p in params_snapshot:
+            try:
+                await self.subscribe(
+                    app=p["app"],
+                    path=p["path"],
+                    on_event=p["on_event"],
+                    on_err=p["on_err"],
+                    on_quit=p["on_quit"],
+                )
+            except Exception as exc:
+                logger.error("Tlon: failed to re-subscribe %s%s: %s",
+                             p["app"], p["path"], exc)
+
+    async def _reconnect_after_quit(self) -> None:
+        """Re-subscribe after Eyre terminates a subscription with a quit event.
+
+        Eyre sends ``response: "quit"`` when it kills a subscription due to:
+          - event buffer overflow (most common; mitigated by low _ACK_THRESHOLD)
+          - Gall agent restart / desk upgrade
+          - ship reboot (in that case the SSE stream also closes, triggering
+            the normal _sse_loop reconnect path independently)
+
+        Eyre delivers the quit *over* the existing SSE stream, which stays
+        open.  So _sse_loop never sees an exception and never runs its own
+        reconnect logic.  This method bridges that gap: it re-subscribes on
+        the existing channel so the bot doesn't silently go deaf.
+        """
+        await asyncio.sleep(0.25)  # brief pause so Eyre can settle
+        try:
+            await self._resubscribe_all()
+            logger.info("Tlon: resubscribed after quit event")
+        except Exception as exc:
+            logger.error(
+                "Tlon: resubscribe-after-quit failed: %s — "
+                "will retry when the SSE stream next reconnects", exc
+            )
 
     # ── High-level DM send ────────────────────────────────────────────────
 
@@ -556,14 +761,15 @@ class UrbitClient:
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     async def close(self) -> None:
-        """Cancel the SSE task and close the HTTP session."""
+        """Cancel the SSE + keepalive tasks and close the HTTP session."""
         self._sse_closed = True
-        if self._sse_task and not self._sse_task.done():
-            self._sse_task.cancel()
-            try:
-                await self._sse_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._sse_task, self._keepalive_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self._session and not self._session.closed:
             await self._session.close()
         self._authenticated = False

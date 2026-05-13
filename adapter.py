@@ -25,6 +25,7 @@ import asyncio
 import datetime
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -39,6 +40,46 @@ from gateway.platforms.base import (
 from gateway.config import Platform, PlatformConfig
 
 from .urbit import UrbitClient, story_to_text
+
+
+# ---------------------------------------------------------------------------
+# Tlon ↔ Hermes command text helpers
+# ---------------------------------------------------------------------------
+
+# Tlon clients treat any message starting with "/" as a local client command
+# and refuse to send it.  The gateway's approval prompts instruct users to
+# type "/approve" etc. — we rewrite those in outbound text so users see the
+# slash-free form ("approve", "deny", …) which we then re-add on the way in.
+
+# Matches `/approve…` or `/deny…` when wrapped in backticks
+_SLASH_IN_BACKTICK_RE = re.compile(r"(?<=`)/(?=(?:approve|deny)\b)")
+
+def _strip_slashes_for_tlon(text: str) -> str:
+    """Remove leading '/' from gateway command hints in backticks.
+
+    Turns `` `/approve always` `` → `` `approve always` `` so Tlon users
+    can type the command without the slash that their client would swallow.
+    """
+    return _SLASH_IN_BACKTICK_RE.sub("", text)
+
+
+# Matches the exact bare approval replies a Tlon user would type
+_BARE_APPROVAL_RE = re.compile(
+    r"^(?:approve(?:\s+(?:all\s+)?(?:once|session|always))?|deny(?:\s+all)?)$",
+    re.IGNORECASE,
+)
+
+def _restore_slash_for_gateway(text: str) -> str:
+    """Prepend '/' to bare approval/deny replies so the gateway recognises them.
+
+    Tlon users type "approve always" (no slash); the gateway expects "/approve
+    always".  Only exact-match phrases are normalised so normal sentences are
+    never accidentally rewritten.
+    """
+    stripped = text.strip()
+    if _BARE_APPROVAL_RE.match(stripped):
+        return "/" + stripped
+    return text
 
 
 class TlonPlatformAdapter(BasePlatformAdapter):
@@ -149,7 +190,16 @@ class TlonPlatformAdapter(BasePlatformAdapter):
         if not target.startswith("~"):
             target = f"~{target}"
 
-        logger.info("Tlon: sending DM to %s", target)
+        # Tlon clients can't send "/command" — rewrite approval hints in text
+        content = _strip_slashes_for_tlon(content)
+
+        # Use thread_id from metadata as reply_to when the gateway provides it
+        # (set when the inbound message was itself a thread reply)
+        if reply_to is None and isinstance(metadata, dict):
+            reply_to = metadata.get("thread_id") or None
+
+        logger.info("Tlon: sending DM to %s%s", target,
+                    f" (thread {reply_to})" if reply_to else "")
         try:
             message_id = await self.client.send_dm(
                 to_ship=target,
@@ -198,20 +248,41 @@ class TlonPlatformAdapter(BasePlatformAdapter):
 
         whom = payload.get("whom", "")
         response = payload.get("response", {})
-
-        # We only care about "add" (new message)
-        add = response.get("add") if isinstance(response, dict) else None
-        if not add:
+        if not isinstance(response, dict):
             return
 
-        essay = add.get("essay") if isinstance(add, dict) else None
-        if not isinstance(essay, dict):
-            return
+        # --- top-level message ("add") ---
+        add = response.get("add")
+        if isinstance(add, dict):
+            essay = add.get("essay")
+            if not isinstance(essay, dict):
+                return
+            author = essay.get("author", "")
+            content = essay.get("content", [])
+            sent = essay.get("sent")
+            msg_id = payload.get("id", f"{author}/{int(time.time()*1000)}")
 
-        author = essay.get("author", "")
-        content = essay.get("content", [])
-        sent = essay.get("sent")
-        msg_id = payload.get("id", f"{author}/{int(time.time()*1000)}")
+        # --- thread reply ("reply") ---
+        elif isinstance(response.get("reply"), dict):
+            reply_wrapper = response["reply"]
+            delta = reply_wrapper.get("delta", {})
+            reply_add = delta.get("add", {}) if isinstance(delta, dict) else {}
+            essay = reply_add.get("reply-essay") if isinstance(reply_add, dict) else None
+            if not isinstance(essay, dict):
+                return
+            author = essay.get("author", "")
+            content = essay.get("content", [])
+            sent = essay.get("sent")
+            # Use the reply's own id if available, else fall back to thread root id
+            msg_id = reply_wrapper.get("id") or payload.get("id", f"{author}/{int(time.time()*1000)}")
+            # thread_root_id: the message this reply is anchored to.
+            # Stored as thread_id on the source so the gateway passes it back
+            # to send() as metadata["thread_id"], keeping the reply in-thread.
+            _thread_root_id = payload.get("id") or None
+
+        # --- other deltas (reactions, deletions, etc.) — ignore ---
+        else:
+            return
 
         # Normalise author ship
         if isinstance(author, dict):
@@ -231,6 +302,11 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             logger.debug("Tlon: ignoring empty/non-text DM from %s", author)
             return
 
+        # Normalize bare approval replies — Tlon can't send "/approve" because
+        # the client intercepts slash-commands, so users type "approve always"
+        # etc. and we restore the slash before the gateway sees the message.
+        text = _restore_slash_for_gateway(text)
+
         # Access control
         if not self._is_ship_allowed(author):
             logger.info("Tlon: DM from %s blocked (not in allowlist)", author)
@@ -241,12 +317,16 @@ class TlonPlatformAdapter(BasePlatformAdapter):
 
         logger.info("Tlon: inbound DM from %s: %r", author, text[:80])
 
+        # thread_root_id is set for thread replies (None for top-level messages)
+        _thread_root_id = locals().get("_thread_root_id")
+
         source = self.build_source(
             chat_id=chat_id,
             chat_name=author,
             chat_type="dm",
             user_id=author,
             user_name=author,
+            thread_id=_thread_root_id,
         )
 
         event = MessageEvent(
