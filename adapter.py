@@ -1,8 +1,8 @@
 """
 Tlon/Urbit Platform Adapter for Hermes Agent.
 
-Connects to an Urbit ship and relays DMs to/from the Hermes agent via
-the gateway.  Group channel support is Phase 3.
+Connects to an Urbit ship and relays DMs, group DMs (clubs), and group
+channels to/from the Hermes agent via the gateway.
 
 Configuration in config.yaml::
 
@@ -18,7 +18,8 @@ Configuration in config.yaml::
 Or via environment variables (highest priority):
     TLON_SHIP_URL, TLON_SHIP, TLON_LOGIN_CODE,
     TLON_HOME_CHANNEL, TLON_OWNER_SHIP,
-    TLON_ALLOWED_USERS, TLON_ALLOW_ALL_USERS
+    TLON_ALLOWED_USERS, TLON_ALLOW_ALL_USERS,
+    TLON_CHANNELS  (comma-separated channel nests, e.g. "chat/~host/name"; "*" = all)
 """
 
 import asyncio
@@ -85,7 +86,8 @@ def _restore_slash_for_gateway(text: str) -> str:
 class TlonPlatformAdapter(BasePlatformAdapter):
     """Async Tlon/Urbit adapter implementing the BasePlatformAdapter interface.
 
-    Phase 2: DM send + receive via Urbit HTTP channel API + SSE.
+    Supports 1-on-1 DMs, group DMs (clubs), and group channels via Urbit HTTP
+    channel API + SSE.
     """
 
     def __init__(self, config: PlatformConfig):
@@ -104,13 +106,25 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             os.getenv("TLON_LOGIN_CODE") or extra.get("login_code", "")
         ).strip()
 
-        # Access control
-        raw_allowed = os.getenv("TLON_ALLOWED_USERS", "")
+        # Access control — env vars override config.yaml extra keys
+        raw_allowed = os.getenv("TLON_ALLOWED_USERS") or extra.get("allowed_users", "")
         self._allowed_ships: set[str] = {
             s.strip() for s in raw_allowed.split(",") if s.strip()
         }
-        self._allow_all: bool = os.getenv("TLON_ALLOW_ALL_USERS", "").strip() in ("1", "true", "yes")
-        self._owner_ship: str = os.getenv("TLON_OWNER_SHIP", "").strip()
+        allow_all_raw = os.getenv("TLON_ALLOW_ALL_USERS") or str(extra.get("allow_all_users", ""))
+        self._allow_all: bool = allow_all_raw.strip() in ("1", "true", "yes")
+        self._owner_ship: str = (
+            os.getenv("TLON_OWNER_SHIP") or extra.get("owner_ship", "")
+        ).strip()
+
+        # Group channel filter — set of nest IDs to accept; empty = off; {"*"} = all
+        raw_channels = (
+            os.getenv("TLON_CHANNELS") or extra.get("channels", "")
+        )
+        if isinstance(raw_channels, list):
+            self._channel_filter: set[str] = {c.strip() for c in raw_channels if c.strip()}
+        else:
+            self._channel_filter = {c.strip() for c in str(raw_channels).split(",") if c.strip()}
 
         self.client = UrbitClient(
             ship_url=self.ship_url,
@@ -158,10 +172,30 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             logger.error("Tlon: failed to subscribe to chat /v4: %s", exc)
             return False
 
+        # Subscribe to %channels /v4 — receives channel post events
+        try:
+            await self.client.subscribe(
+                app="channels",
+                path="/v4",
+                on_event=self._on_channel_event,
+            )
+        except Exception as exc:
+            logger.error("Tlon: failed to subscribe to channels /v4: %s", exc)
+            return False
+
         # Start the background SSE reader
         await self.client.open_sse_stream()
         self._mark_connected()
-        logger.info("Tlon: connected and listening for DMs.")
+        if self._channel_filter:
+            logger.info(
+                "Tlon: connected and listening for DMs + channels (%s).",
+                ", ".join(sorted(self._channel_filter)),
+            )
+        else:
+            logger.info(
+                "Tlon: connected and listening for DMs. "
+                "Set TLON_CHANNELS to also receive group channel messages."
+            )
         return True
 
     async def disconnect(self) -> None:
@@ -179,43 +213,80 @@ class TlonPlatformAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a message to a Tlon DM.
+        """Send a message to a Tlon DM, club (group DM), or group channel.
 
         chat_id formats accepted:
-          - "~sampel-palnet"       (bare ship name)
-          - "dm/~sampel-palnet"    (openclaw-style DM prefix)
+          - "~sampel-palnet"            (1-on-1 DM: bare ship name)
+          - "dm/~sampel-palnet"         (1-on-1 DM: openclaw-style prefix)
+          - "club/0v3.abc12"            (group DM: club/ prefix)
+          - "0v3.abc12"                 (group DM: bare club ID)
+          - "channel/chat/~host/name"   (group channel: channel/ + nest)
         """
-        # Normalise: strip the "dm/" prefix if present
-        target = chat_id.removeprefix("dm/").strip()
-        if not target.startswith("~"):
-            target = f"~{target}"
-
         # Tlon clients can't send "/command" — rewrite approval hints in text
         content = _strip_slashes_for_tlon(content)
 
         # Use thread_id from metadata as reply_to when the gateway provides it
-        # (set when the inbound message was itself a thread reply)
         if reply_to is None and isinstance(metadata, dict):
             reply_to = metadata.get("thread_id") or None
 
-        logger.info("Tlon: sending DM to %s%s", target,
-                    f" (thread {reply_to})" if reply_to else "")
-        try:
-            message_id = await self.client.send_dm(
-                to_ship=target,
-                text=content,
-                reply_to=reply_to,
-            )
-            return SendResult(success=True, message_id=message_id)
-        except Exception as exc:
-            logger.error("Tlon: send failed to %s: %s", target, exc)
-            return SendResult(success=False, error=str(exc))
+        # --- Group channel ---
+        if chat_id.startswith("channel/"):
+            nest = chat_id.removeprefix("channel/")
+            logger.info("Tlon: sending channel post to %s%s", nest,
+                        f" (thread {reply_to})" if reply_to else "")
+            try:
+                message_id = await self.client.send_channel_post(
+                    nest=nest,
+                    text=content,
+                    reply_to=reply_to,
+                )
+                return SendResult(success=True, message_id=message_id)
+            except Exception as exc:
+                logger.error("Tlon: channel send failed to %s: %s", nest, exc)
+                return SendResult(success=False, error=str(exc))
+
+        # Route to club or DM send based on chat_id format
+        bare = chat_id.removeprefix("club/").removeprefix("dm/").strip()
+        is_club = bare.startswith("0v")
+
+        if is_club:
+            logger.info("Tlon: sending club message to %s%s", bare,
+                        f" (thread {reply_to})" if reply_to else "")
+            try:
+                message_id = await self.client.send_club_msg(
+                    club_id=bare,
+                    text=content,
+                    reply_to=reply_to,
+                )
+                return SendResult(success=True, message_id=message_id)
+            except Exception as exc:
+                logger.error("Tlon: club send failed to %s: %s", bare, exc)
+                return SendResult(success=False, error=str(exc))
+        else:
+            # 1-on-1 DM — ensure ship has "~" prefix
+            target = bare if bare.startswith("~") else f"~{bare}"
+            logger.info("Tlon: sending DM to %s%s", target,
+                        f" (thread {reply_to})" if reply_to else "")
+            try:
+                message_id = await self.client.send_dm(
+                    to_ship=target,
+                    text=content,
+                    reply_to=reply_to,
+                )
+                return SendResult(success=True, message_id=message_id)
+            except Exception as exc:
+                logger.error("Tlon: send failed to %s: %s", target, exc)
+                return SendResult(success=False, error=str(exc))
 
     # ── Chat info ─────────────────────────────────────────────────────────
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        target = chat_id.removeprefix("dm/").strip()
-        return {"name": target, "type": "dm", "platform": "tlon"}
+        if chat_id.startswith("channel/"):
+            nest = chat_id.removeprefix("channel/")
+            return {"name": nest, "type": "channel", "platform": "tlon"}
+        bare = chat_id.removeprefix("club/").removeprefix("dm/").strip()
+        chat_type = "club" if bare.startswith("0v") else "dm"
+        return {"name": bare, "type": chat_type, "platform": "tlon"}
 
     # ── Inbound DM handler ────────────────────────────────────────────────
 
@@ -312,18 +383,26 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             logger.info("Tlon: DM from %s blocked (not in allowlist)", author)
             return
 
-        # Use the sender ship as chat_id for DMs
-        chat_id = author
+        # Use the sender ship as chat_id for 1-on-1 DMs;
+        # use the club ID for group DMs (clubs start with "0v")
+        if isinstance(whom, str) and whom.startswith("0v"):
+            chat_id = f"club/{whom}"
+            chat_type = "club"
+            chat_name = whom
+        else:
+            chat_id = author
+            chat_type = "dm"
+            chat_name = author
 
-        logger.info("Tlon: inbound DM from %s: %r", author, text[:80])
+        logger.info("Tlon: inbound %s from %s: %r", chat_type, author, text[:80])
 
         # thread_root_id is set for thread replies (None for top-level messages)
         _thread_root_id = locals().get("_thread_root_id")
 
         source = self.build_source(
             chat_id=chat_id,
-            chat_name=author,
-            chat_type="dm",
+            chat_name=chat_name,
+            chat_type=chat_type,
             user_id=author,
             user_name=author,
             thread_id=_thread_root_id,
@@ -338,6 +417,147 @@ class TlonPlatformAdapter(BasePlatformAdapter):
         )
 
         # handle_message is synchronous in BasePlatformAdapter
+        asyncio.create_task(self._dispatch(event))
+
+    # ── Inbound channel handler ───────────────────────────────────────────
+
+    def _on_channel_event(self, payload: Any) -> None:
+        """Called by UrbitClient for each channels /v4 SSE event.
+
+        Expected payload shape (ChannelsSubscribeResponse):
+          {
+            "nest": "chat/~host/channel-name",
+            "response": {
+              "post": {
+                "id": "170...",
+                "r-post": {
+                  "set": {
+                    "seal": {...},
+                    "essay": {
+                      "content": [...story...],
+                      "author":  "~sender",
+                      "sent":    1715134800000,
+                      "kind":    "/chat",
+                      "blob":    null,
+                      "meta":    null
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+        For thread replies "r-post" contains a "reply" key instead of "set".
+        Deletions have {"set": null}.
+        """
+        if not isinstance(payload, dict):
+            return
+
+        nest = payload.get("nest", "")
+        if not nest:
+            return
+
+        # Apply channel filter
+        if not self._channel_filter:
+            logger.debug(
+                "Tlon: channel event from %s ignored (TLON_CHANNELS not set)", nest
+            )
+            return
+        if "*" not in self._channel_filter and nest not in self._channel_filter:
+            logger.debug("Tlon: channel event from %s ignored (not in TLON_CHANNELS)", nest)
+            return
+
+        response = payload.get("response", {})
+        if not isinstance(response, dict):
+            return
+
+        post_resp = response.get("post")
+        if not isinstance(post_resp, dict):
+            return
+
+        post_id = post_resp.get("id", "")
+        r_post = post_resp.get("r-post", {})
+        if not isinstance(r_post, dict):
+            return
+
+        # --- thread reply ---
+        reply_block = r_post.get("reply")
+        if isinstance(reply_block, dict):
+            r_reply = reply_block.get("r-reply", {})
+            if not isinstance(r_reply, dict):
+                return
+            reply_set = r_reply.get("set")
+            if not isinstance(reply_set, dict):
+                return  # deletion or null
+            reply_essay = reply_set.get("essay") or reply_set  # reply-essay may be top-level
+            author = reply_essay.get("author", "")
+            content = reply_essay.get("content", [])
+            sent = reply_essay.get("sent")
+            reply_id = reply_block.get("id", "")
+            msg_id = reply_id or f"{author}/{int(time.time()*1000)}"
+            thread_root_id = post_id or None
+
+        # --- top-level post ---
+        elif "set" in r_post:
+            post_set = r_post.get("set")
+            if not isinstance(post_set, dict):
+                return  # deletion (set=null)
+            essay = post_set.get("essay", {})
+            if not isinstance(essay, dict):
+                return
+            author = essay.get("author", "")
+            content = essay.get("content", [])
+            sent = essay.get("sent")
+            msg_id = post_id or f"{author}/{int(time.time()*1000)}"
+            thread_root_id = None
+
+        else:
+            # Unrecognised r-post shape — skip
+            return
+
+        # Normalise author (may be plain string or {ship: ...} object)
+        if isinstance(author, dict):
+            author = author.get("ship", "")
+        author = str(author).strip()
+        if not author.startswith("~"):
+            author = f"~{author}"
+
+        # Ignore messages sent by the bot itself
+        if author == self.ship:
+            logger.debug("Tlon: ignoring our own channel post (author=%s)", author)
+            return
+
+        text = story_to_text(content) if isinstance(content, list) else str(content)
+        if not text.strip():
+            logger.debug("Tlon: ignoring empty channel post from %s in %s", author, nest)
+            return
+
+        text = _restore_slash_for_gateway(text)
+
+        if not self._is_ship_allowed(author):
+            logger.info("Tlon: channel post from %s blocked (not in allowlist)", author)
+            return
+
+        chat_id = f"channel/{nest}"
+        logger.info("Tlon: inbound channel post from %s in %s: %r", author, nest, text[:80])
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=nest,
+            chat_type="channel",
+            user_id=author,
+            user_name=author,
+            thread_id=thread_root_id,
+        )
+
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=str(msg_id),
+            timestamp=datetime.datetime.now(),
+        )
+
         asyncio.create_task(self._dispatch(event))
 
     async def _dispatch(self, event: MessageEvent) -> None:

@@ -6,7 +6,7 @@ Implements the Urbit ship HTTP API used by Tlon:
   - Channel:    PUT  /~/channel/<uid>  (open, poke, subscribe, ack)
   - SSE stream: GET  /~/channel/<uid>  (EventSource)
 
-DM scope only (Phase 2).  Group channel support is Phase 3.
+Supports DMs, group DMs (clubs), and group channels (Phase 3).
 
 References:
   - openclaw-tlon src/urbit/sse-client.ts  (SSE lifecycle + ack logic)
@@ -756,6 +756,167 @@ class UrbitClient:
         await self.poke("chat", "chat-dm-action-2", dm_action_json)
 
         logger.info("Tlon: DM sent to %s (msg %s)", to_ship, msg_id)
+        return msg_id
+
+    # ── High-level club (group DM) send ──────────────────────────────────
+
+    async def send_club_msg(
+        self,
+        club_id: str,
+        text: str,
+        reply_to: Optional[str] = None,
+    ) -> str:
+        """Send a message to a Tlon club (group DM / multi-DM).
+
+        club_id:  club UUID, e.g. "0v3.abc12" (with or without leading "0v")
+        text:     message content (markdown supported)
+        reply_to: optional message ID to thread-reply to
+
+        Returns a message_id string.
+        Raises on auth or poke failure.
+        """
+        if not self._authenticated:
+            ok = await self._reauth()
+            if not ok:
+                raise RuntimeError("Tlon: authentication failed — cannot send club message")
+
+        sent_at = int(time.time() * 1000)
+        story = text_to_story(text)
+        msg_id = make_msg_id(self.ship, sent_at)
+
+        essay = {
+            "content": story,
+            "author": self.ship,
+            "sent": sent_at,
+            "kind": "/chat",
+            "blob": None,
+            "meta": None,
+        }
+
+        if reply_to:
+            # Thread reply inside a club
+            reply_id = make_msg_id(self.ship, sent_at)
+            writ_delta = {
+                "id": reply_to,
+                "delta": {
+                    "reply": {
+                        "id": reply_id,
+                        "meta": None,
+                        "delta": {
+                            "add": {
+                                "reply-essay": {
+                                    "content": story,
+                                    "author": self.ship,
+                                    "sent": sent_at,
+                                    "blob": None,
+                                },
+                                "time": None,
+                            }
+                        },
+                    }
+                },
+            }
+        else:
+            # New top-level club message
+            writ_delta = {
+                "id": msg_id,
+                "delta": {
+                    "add": {
+                        "essay": essay,
+                        "time": None,
+                    }
+                },
+            }
+
+        club_action_json = {
+            "id": club_id,
+            "diff": {
+                "uid": "0v4",   # constant — see multiDmAction() in Tlon dms.ts
+                "delta": {
+                    "writ": writ_delta,
+                },
+            },
+        }
+
+        await self.poke("chat", "chat-club-action-2", club_action_json)
+        logger.info("Tlon: club message sent to %s (msg %s)", club_id, msg_id)
+        return msg_id
+
+    # ── High-level group channel send ─────────────────────────────────────
+
+    async def send_channel_post(
+        self,
+        nest: str,
+        text: str,
+        reply_to: Optional[str] = None,
+    ) -> str:
+        """Send a message to a Tlon group channel.
+
+        nest:     channel nest ID, e.g. "chat/~host/channel-name"
+        text:     message content (markdown supported)
+        reply_to: optional parent post ID for thread replies
+
+        Returns a message_id string.
+        Raises on auth or poke failure.
+        """
+        if not self._authenticated:
+            ok = await self._reauth()
+            if not ok:
+                raise RuntimeError("Tlon: authentication failed — cannot send channel post")
+
+        sent_at = int(time.time() * 1000)
+        story = text_to_story(text)
+        msg_id = make_msg_id(self.ship, sent_at)
+
+        if reply_to:
+            # Thread reply inside a channel (PostActionReply)
+            channel_action_json = {
+                "channel": {
+                    "nest": nest,
+                    "action": {
+                        "post": {
+                            "reply": {
+                                "id": reply_to,
+                                "action": {
+                                    "add": {
+                                        "reply-essay": {
+                                            "content": story,
+                                            "author": self.ship,
+                                            "sent": sent_at,
+                                            "blob": None,
+                                        },
+                                        "time": None,
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+        else:
+            # New top-level post (PostActionAdd)
+            essay = {
+                "content": story,
+                "author": self.ship,
+                "sent": sent_at,
+                "kind": "/chat",
+                "blob": None,
+                "meta": None,
+            }
+            channel_action_json = {
+                "channel": {
+                    "nest": nest,
+                    "action": {
+                        "post": {
+                            "add": essay,
+                        }
+                    },
+                }
+            }
+
+        # Agent: %channels, mark: channel-action-2 (current Tlon version)
+        await self.poke("channels", "channel-action-2", channel_action_json)
+        logger.info("Tlon: channel post sent to %s (msg %s)", nest, msg_id)
         return msg_id
 
     # ── Lifecycle ─────────────────────────────────────────────────────────

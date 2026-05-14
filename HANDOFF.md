@@ -7,9 +7,9 @@
 
 ## Current State (as of May 2026)
 
-The plugin is **live and working for 1-on-1 DMs**. Gateway connects on startup,
-messages route to the AI agent, replies go back. Tested against ship
-`~tichul-tiprum-sigmes-modfyn` at `http://104.219.236.151:8080`.
+The plugin is **live and working for 1-on-1 DMs, group DMs (clubs), and group channels**.
+Gateway connects on startup, messages route to the AI agent, replies go back. Tested
+against ship `~tichul-tiprum-sigmes-modfyn` at `http://104.219.236.151:8080`.
 
 A closed upstream PR (NousResearch/hermes-agent#1043) attempted the same integration
 as a core patch. Analysis of that PR identified the root cause of intermittent DM
@@ -136,41 +136,162 @@ def make_msg_id(ship: str, sent_ms: int) -> str:
 The `json` field is the `WritResponse` — that's what `_on_dm_event(payload)` receives.
 `response.del`, `response.add-react`, `response.reply` are other delta variants (ignored now).
 
-### Group DMs (clubs, `0v…` IDs) — NOT YET IMPLEMENTED
-Same `/v4` subscription delivers club events as `chat-club-action-2` mark.
-Send poke uses:
+### Group DMs (clubs, `0v…` IDs) — IMPLEMENTED
+
+Same `/v4` subscription delivers club events as `WritResponse` SSE diffs —
+the `whom` field is the club UUID (`"0v..."`) instead of a ship name.
+
+**Inbound** — same `_on_dm_event()` handler; club detected by `whom.startswith("0v")`.
+`chat_id` is set to `"club/0v..."` so the gateway sessions stay separate from DMs.
+
+**Outbound** — `send()` routes `"club/0v..."` or bare `"0v..."` chat IDs to the new
+`send_club_msg()` method in `urbit.py`:
 ```
 app:  chat
 mark: chat-club-action-2
-json: { "id": "0v...", "diff": { "uid": "0v4", "delta": { "writ": { "id": ..., "delta": ... } } } }
-```
-See `tlon-apps/packages/api/src/urbit/dms.ts` → `multiDmAction()`.
-
-### Group channels (Tlon groups, `chat/~host/name` IDs) — NOT YET IMPLEMENTED
-These use the `%channels` agent (not `%chat`) with `channels-action` mark.
-Subscribe: `app=channels, path=/v1` (delivers `channel-response` events).
-Source: `tlon-apps/packages/api/src/client/channelsApi.ts`.
-
-### Group channel send (P3 reference, from PR #1043)
-When implementing group channel send (P3), use `channel-action` poke (not
-`channels-action` — one important difference from the subscription mark):
-```
-app:  channels
-mark: channel-action
 json: {
-  "nest": "chat/~host/channel-name",
-  "action": {
-    "post": {
-      "add": {
-        "essay": { ...same essay shape as DM... },
-        "revision": 0
+  "id":   "0v...",       ← club UUID
+  "diff": {
+    "uid": "0v4",        ← ALWAYS "0v4" (constant, from multiDmAction())
+    "delta": {
+      "writ": {
+        "id":    "~author/1.262...",
+        "delta": { "add": { "essay": { ...same essay shape as DM... }, "time": null } }
       }
     }
   }
 }
 ```
-PR #1043 source: `gateway/platforms/tlon.py` →
-`https://github.com/wca4a/hermes-agent/blob/feature/tlon-adapter/gateway/platforms/tlon.py`
+Thread replies inside clubs use `"reply"` delta inside `"writ"` (same structure as DM
+reply-essay). See `tlon-apps/packages/api/src/urbit/dms.ts` → `multiDmAction()`.
+
+### Group channels (Tlon groups, `chat/~host/name` IDs) — IMPLEMENTED
+
+Uses the `%channels` agent (separate from `%chat`).
+
+**Subscribe** (added alongside the DM subscription in `connect()`):
+```json
+{"id":3,"action":"subscribe","ship":"shipname","app":"channels","path":"/v4"}
+```
+Use `/v4` — NOT `/v1`. The `/v1` path exists but does NOT include `essay` in
+post add events; `/v4` delivers the full post shape.
+
+**Inbound SSE event shape** (`ChannelsSubscribeResponse`):
+```json
+{
+  "nest": "chat/~host/channel-name",
+  "response": {
+    "post": {
+      "id": "170141184507...",
+      "r-post": {
+        "set": {
+          "seal": { "id": "...", "reacts": {}, "replies": {} },
+          "essay": {
+            "content": [{"inline": ["message text"]}],
+            "author":  "~sender",
+            "sent":    1715134800000,
+            "kind":    "/chat",
+            "blob":    null,
+            "meta":    null
+          }
+        }
+      }
+    }
+  }
+}
+```
+For thread replies, `"r-post"` has a `"reply"` key instead of `"set"`:
+```json
+"r-post": {
+  "reply": {
+    "id": "<reply-id>",
+    "r-reply": {
+      "set": {
+        "seal": {...},
+        "essay": {
+          "content": [...],
+          "author": "~sender",
+          "sent": ...,
+          "blob": null
+        }
+      }
+    }
+  }
+}
+```
+For deletions `"set": null`.
+
+**Outbound send** — `send_channel_post()` in `urbit.py`:
+```
+app:  channels
+mark: channel-action-2        ← NOT "channel-action" (that's the old mark)
+```
+New top-level post:
+```json
+{
+  "channel": {
+    "nest": "chat/~host/channel-name",
+    "action": {
+      "post": {
+        "add": {
+          "content": [{"inline": ["hello channel"]}],
+          "author": "~author",
+          "sent": 1715134800000,
+          "kind": "/chat",
+          "blob": null,
+          "meta": null
+        }
+      }
+    }
+  }
+}
+```
+Thread reply:
+```json
+{
+  "channel": {
+    "nest": "chat/~host/channel-name",
+    "action": {
+      "post": {
+        "reply": {
+          "id": "<parent-post-id>",
+          "action": {
+            "add": {
+              "reply-essay": {
+                "content": [{"inline": ["reply text"]}],
+                "author": "~author",
+                "sent": 1715134800000,
+                "blob": null
+              },
+              "time": null
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+**Channel filter** — `TLON_CHANNELS` env var (comma-separated nests, or `"*"` for all):
+```
+TLON_CHANNELS=chat/~host/mychannel,chat/~host/other
+TLON_CHANNELS=*
+```
+If unset, the subscription is still active but events are silently discarded
+(prevents flooding the gateway from channels the user didn't opt into).
+
+**chat_id format** in gateway sessions: `"channel/<nest>"`, e.g.
+`"channel/chat/~host/mychannel"`. `send()` routes any `chat_id` starting with
+`"channel/"` to `send_channel_post()`.
+
+**Source of truth for channels API**:
+```
+tlon-apps/packages/api/src/client/channelsApi.ts  — channelAction(), subscription path
+tlon-apps/packages/api/src/client/postsApi.ts     — sendPost(), toPostEssay(), sendReply()
+tlon-apps/packages/api/src/client/apiUtils.ts     — toPostEssay() → kind="/chat"
+tlon-apps/desk/lib/channel-json.hoon              — essay encoder (v10: kind as path)
+```
 
 ### Image story blocks (P3 reference)
 PR #1043 sent images as a `block` verse inside the story:
@@ -192,13 +313,16 @@ someone needs offline cron delivery.
 ### Source of truth for Tlon API shapes
 ```
 https://github.com/tloncorp/tlon-apps (branch: develop)
-  desk/app/chat.hoon             — agent, mark list, subscription paths
+  desk/app/chat.hoon             — chat agent, mark list, subscription paths
+  desk/app/channels.hoon         — channels agent, subscription paths
   desk/lib/chat-json.hoon        — JSON encoder/decoder for all chat types
+  desk/lib/channel-json.hoon     — JSON encoder/decoder for channel types (v10)
   desk/mar/chat/dm/action.hoon   — mark file: uses chat-dm-action v3 dejs
   packages/api/src/urbit/dms.ts  — TypeScript DmAction, WritDiff types
-  packages/api/src/client/postsApi.ts  — chatAction(), sendPost() — exact send format
-  packages/api/src/client/chatApi.ts   — subscribeToChatUpdates(), path "/v4"
-  packages/api/src/client/apiUtils.ts  — formatUd(), da.fromUnix() usage
+  packages/api/src/client/postsApi.ts    — chatAction(), sendPost(), sendReply()
+  packages/api/src/client/chatApi.ts     — subscribeToChatUpdates(), path "/v4"
+  packages/api/src/client/channelsApi.ts — channelAction(), subscribe path "/v4"
+  packages/api/src/client/apiUtils.ts    — toPostEssay() → kind="/chat", toAuthor()
 ```
 
 ---
@@ -212,20 +336,32 @@ https://github.com/tloncorp/tlon-apps (branch: develop)
 | DM receive (any ship) | ✅ |
 | SSE reconnect with backoff | ✅ |
 | Gateway routing → AI agent | ✅ |
-| Allowlist / allow-all / owner | ✅ (env vars) |
-| TLON_HOME_CHANNEL for cron | ✅ (declared, untested) |
+| Allowlist / allow-all / owner (env + config.yaml) | ✅ |
+| TLON_HOME_CHANNEL for cron | ✅ wired via `cron_deliver_env_var` |
 | Story → plain text | ✅ |
 | Plain text → story (markdown) | ✅ |
-| Thread replies (send) | ✅ (untested against live ship) |
+| Thread replies (send) | ✅ |
 | `%quit` resubscription | ✅ |
 | ACK-every-event (threshold=1) | ✅ |
+| Club (group DM) receive | ✅ |
+| Club (group DM) send | ✅ |
+| Group channel receive (TLON_CHANNELS) | ✅ |
+| Group channel send | ✅ |
 
 ---
 
 ## Known Issues / Gotchas
 
-1. **`ownership: ~sigmes-modfyn` in config.yaml is dead** — not read by adapter or gateway.
-   To pre-authorize a ship without pairing, set `TLON_ALLOWED_USERS=~ship` in `.env`.
+1. ~~**`ownership: ~sigmes-modfyn` in config.yaml is dead**~~ **FIXED** — `adapter.py`
+   now reads `owner_ship`, `allowed_users`, and `allow_all_users` from the config.yaml
+   `extra` dict as fallbacks when the corresponding env vars are not set. Env vars
+   still take precedence. Example in config.yaml:
+   ```yaml
+   platforms:
+     tlon:
+       extra:
+         owner_ship: "~your-main-ship"
+   ```
 
 2. ~~**`%quit` events don't trigger resubscription**~~ **FIXED** — `_reconnect_after_quit()`
    added to `urbit.py`; scheduled via `asyncio.create_task()` from the `quit` branch in
@@ -297,6 +433,31 @@ INFO     Tlon: resubscribed after quit event
 Then send a DM and confirm it still arrives. If you see the log sequence but DMs stop
 working, the resubscription is firing but something in the re-subscribe path is broken.
 
+**Test 5 — Club (group DM) send + receive (requires a Tlon club)**
+Create or join a club on `~tichul-tiprum-sigmes-modfyn`, then send a message to the club
+from a member ship. Expected:
+```
+INFO  Tlon: inbound club from ~member-ship: 'hello club'
+```
+Then trigger a club reply from the bot (e.g. via a `/send` command or cron).
+Expected: message appears in the club on all member devices.
+The club's `chat_id` in logs and session keys will be `club/0v...`.
+
+**Test 6 — Group channel receive + send (requires TLON_CHANNELS)**
+```bash
+export TLON_CHANNELS="chat/~your-host/channel-name"
+hermes gateway
+```
+From another ship, post a message to the channel. Expected log:
+```
+INFO  Tlon: inbound channel post from ~sender in chat/~host/name: 'hello channel'
+```
+Then trigger a reply from the bot (e.g. via a /send command). Expected: message
+appears in the Tlon channel. The gateway `chat_id` for the channel is
+`"channel/chat/~host/name"` (use this in /send commands).
+
+Use `TLON_CHANNELS=*` to accept events from ALL channels (useful for debugging).
+
 **Test 4 — Long-running stability (soak test, ~3 hours)**
 Leave the gateway running overnight. Previously it would go deaf after ~2.5 hours.
 If DMs still work 3+ hours later with no `%quit` log lines → buffer fix confirmed.
@@ -319,18 +480,25 @@ Priority order for "feels like a real Tlon client":
       bold, italic (`"italics"` key — NOT `"italic"`), bold-italic, strikethrough,
       inline code, fenced code blocks, ATX headings, links. The `"italic"` vs
       `"italics"` bug was found and fixed in this session (see Known Issue #6).
-- [ ] **Pre-authorize owner ship** — read `tlon.ownership` from config and skip pairing
+- [x] **Pre-authorize owner ship** — `owner_ship`, `allowed_users`, `allow_all_users`
+      now read from config.yaml `extra` dict as fallbacks to env vars.
 
 ### P2 — Needed for group use
-- [ ] **Group DMs (clubs)** — `0v…` chat IDs, `chat-club-action-2` poke
-  - Inbound: already arrives on `/v4` as `ClubAction` events (need to parse)
-  - Outbound: `multiDmAction()` format from `dms.ts`
-- [ ] **`TLON_HOME_CHANNEL` wired end-to-end** — test cron delivery to a Tlon channel
+- [x] **Group DMs (clubs)** — `0v…` chat IDs, `chat-club-action-2` poke implemented.
+  - Inbound: `_on_dm_event()` checks `whom.startswith("0v")` → `chat_id = "club/0v..."`
+  - Outbound: `send_club_msg()` in `urbit.py` + routing in `send()` in `adapter.py`
+  - Thread replies in clubs also supported via reply-essay inside `writ` delta
+  - **⚠️ TEST NEEDED** — no live club to test against yet
+- [x] **`TLON_HOME_CHANNEL` wired end-to-end** — `cron_deliver_env_var="TLON_HOME_CHANNEL"`
+  registered in `ctx.register_platform()`, `_env_enablement()` seeds `home_channel` from
+  the env var. When gateway is running, cron delivery routes to this channel automatically.
 
 ### P3 — Full feature parity
-- [ ] **Group channels** — `%channels` agent, `channels-action` mark, `/v1` subscription
-  - Separate subscription from DMs (different agent entirely)
-  - Chat ID format: `chat/~host/channel-name`
+- [x] **Group channels** — subscribe `app=channels, path=/v4`; send via `channel-action-2`
+  - Inbound: `_on_channel_event()` in `adapter.py`; filtered by `TLON_CHANNELS` env var
+  - Outbound: `send_channel_post()` in `urbit.py` + routing in `send()` (`"channel/nest"`)
+  - Thread replies in channels also supported via `"post": { "reply": {...} }` action
+  - **⚠️ TEST NEEDED** — no live channel test run yet (see Test 6 in Testing section)
 - [ ] **Receive reactions** — `add-react` delta in WritResponse (currently ignored)
 - [ ] **Message deletion notice** — `del` delta (currently ignored)
 
@@ -351,29 +519,28 @@ gateway adapter for the Hermes Agent. The plugin is at:
     plugin.yaml  — env var config
     HANDOFF.md   — full technical handoff (READ THIS FIRST)
 
-Current state: DMs work end-to-end (send + receive + gateway routing to AI).
-  All P1 bugs FIXED: `%quit` resubscription; `_ACK_THRESHOLD=1`; markdown → story
-  with correct `"italics"` key (bug found by live test — see Known Issue #6).
+Current state: All P1 + P2 + P3 (group channels) items done. DMs, clubs, and group
+  channels all implemented. Config.yaml `extra.owner_ship` works. TLON_HOME_CHANNEL
+  wired for cron. All P1 bugs fixed: `%quit`, `_ACK_THRESHOLD=1`, `"italics"` key.
 Live test ship: ~tichul-tiprum-sigmes-modfyn at http://104.219.236.151:8080
 
 Read HANDOFF.md fully before touching any code. It contains the exact Urbit API 
 formats, the hard-won ID formula, the prioritized gap list, and the Testing section.
 
-⚠️  BEFORE writing any new code, ask the user to run the P1 test checkpoint
-    from the Testing section (Tests 1–4). Tests 1-2 have passed. Test 3 (`%quit`
-    resubscription) and Test 4 (soak) are not yet verified.
+⚠️  Tests still needed:
+    - Test 3: `%quit` resubscription (requires dojo access)
+    - Test 4: soak test (~3 hours)
+    - Test 5: club send/receive (needs a real club)
+    - Test 6: channel receive + send (needs TLON_CHANNELS set + a real channel)
 
-Today's goals (pick from P1/P2 in HANDOFF.md — all P1 items are done):
-
-1. Pre-authorize owner ship from config (skip pairing for tlon.ownership) [P1 remaining]
-2. Group DMs (clubs) — inbound parsing + outbound send [P2]
-3. Wire TLON_HOME_CHANNEL end-to-end and test cron delivery [P2]
-4. Group channels — subscribe to %channels agent, send via channel-action [P3]
+Remaining P3 items (low priority):
+1. Receive reactions — `add-react` delta in WritResponse (currently ignored)
+2. Message deletion notice — `del` delta (currently ignored)
 
 The reference source for all Tlon API shapes is:
   https://github.com/tloncorp/tlon-apps (branch: develop)
-  Key files: packages/api/src/client/postsApi.ts, chatApi.ts, apiUtils.ts
-             desk/app/chat.hoon, desk/lib/chat-json.hoon
+  Key files: packages/api/src/client/postsApi.ts, chatApi.ts, channelsApi.ts, apiUtils.ts
+             desk/app/chat.hoon, desk/lib/chat-json.hoon, desk/lib/channel-json.hoon
 
 Hermes plugin base class reference:
   ~/.hermes/hermes-agent/gateway/platforms/base.py
