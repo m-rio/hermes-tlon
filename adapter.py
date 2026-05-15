@@ -126,6 +126,18 @@ class TlonPlatformAdapter(BasePlatformAdapter):
         else:
             self._channel_filter = {c.strip() for c in str(raw_channels).split(",") if c.strip()}
 
+        # Group channel mention gating
+        # When True, only respond to channel messages that @mention the bot.
+        self._mention_gate: bool = (
+            os.getenv("TLON_MENTION_GATE", "1").strip() not in ("0", "false", "no")
+        )
+        # Bot's display nickname (fetched on connect via contacts scry)
+        self._bot_nickname: Optional[str] = None
+
+        # Auto-discovery of group channels via /groups scry
+        auto_disc_raw = os.getenv("TLON_AUTO_DISCOVER") or str(extra.get("auto_discover", ""))
+        self._auto_discover: bool = auto_disc_raw.strip() in ("1", "true", "yes")
+
         self.client = UrbitClient(
             ship_url=self.ship_url,
             ship=self.ship,
@@ -154,6 +166,24 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             return False
 
         logger.info("Tlon: authenticated as %s.", self.ship or "(unknown)")
+
+        # Fetch the bot's own contact profile for mention detection
+        try:
+            profile = await self.client.scry("/contacts/v1/self.json")
+            if isinstance(profile, dict):
+                nick = profile.get("nickname", {})
+                if isinstance(nick, dict):
+                    nick = nick.get("value", "")
+                self._bot_nickname = str(nick).strip() if nick else None
+                if self._bot_nickname:
+                    logger.info("Tlon: bot nickname: %s", self._bot_nickname)
+        except Exception as exc:
+            logger.debug("Tlon: could not fetch self profile (non-fatal): %s", exc)
+
+        # Auto-discover group channels from /groups scry
+        if self._auto_discover:
+            discovered = await self._discover_channels()
+            self._channel_filter.update(discovered)
 
         try:
             await self.client.open_channel()
@@ -187,14 +217,17 @@ class TlonPlatformAdapter(BasePlatformAdapter):
         await self.client.open_sse_stream()
         self._mark_connected()
         if self._channel_filter:
+            mention_note = " (mention-gated)" if self._mention_gate else " (all messages)"
             logger.info(
-                "Tlon: connected and listening for DMs + channels (%s).",
+                "Tlon: connected — DMs + %d channel(s)%s: %s",
+                len(self._channel_filter),
+                mention_note,
                 ", ".join(sorted(self._channel_filter)),
             )
         else:
             logger.info(
-                "Tlon: connected and listening for DMs. "
-                "Set TLON_CHANNELS to also receive group channel messages."
+                "Tlon: connected — listening for DMs only. "
+                "Set TLON_CHANNELS (or TLON_AUTO_DISCOVER=1) to also receive channel messages."
             )
         return True
 
@@ -310,11 +343,12 @@ class TlonPlatformAdapter(BasePlatformAdapter):
 
         We ignore reactions, deletions, and our own messages.
         """
-        if not isinstance(payload, dict):
+        # DM invite events arrive as a JSON array of {ship: "...", ...} dicts
+        if isinstance(payload, list):
+            asyncio.create_task(self._accept_dm_invites(payload))
             return
 
-        # Some events are arrays (DM invite lists) — skip
-        if isinstance(payload, list):
+        if not isinstance(payload, dict):
             return
 
         whom = payload.get("whom", "")
@@ -538,6 +572,17 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             logger.info("Tlon: channel post from %s blocked (not in allowlist)", author)
             return
 
+        # Mention gate — only respond when the bot is addressed
+        if self._mention_gate and not self._is_bot_mentioned(text):
+            logger.debug(
+                "Tlon: channel post from %s in %s ignored (bot not mentioned)", author, nest
+            )
+            return
+        text = self._strip_bot_mention(text)
+        if not text.strip():
+            logger.debug("Tlon: ignoring channel post that was only a mention from %s", author)
+            return
+
         chat_id = f"channel/{nest}"
         logger.info("Tlon: inbound channel post from %s in %s: %r", author, nest, text[:80])
 
@@ -566,6 +611,151 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             await self.handle_message(event)
         except Exception as exc:
             logger.exception("Tlon: error dispatching message event: %s", exc)
+
+    # ── Mention detection ─────────────────────────────────────────────────
+
+    def _is_bot_mentioned(self, text: str) -> bool:
+        """Return True if the bot's ship name or display nickname appears in text."""
+        lower = text.lower()
+        ship_bare = self.ship.lstrip("~").lower()
+        if ship_bare and (ship_bare in lower or f"~{ship_bare}" in lower):
+            return True
+        if self._bot_nickname and self._bot_nickname.lower() in lower:
+            return True
+        return False
+
+    def _strip_bot_mention(self, text: str) -> str:
+        """Remove leading/inline bot @-mentions from text before passing to AI."""
+        ship_bare = re.escape(self.ship.lstrip("~"))
+        # Strip ~ship or @~ship mentions (with optional trailing space/comma)
+        text = re.sub(
+            rf"(?:@~{ship_bare}|~{ship_bare})[,\s]*",
+            " ", text, flags=re.IGNORECASE,
+        ).strip()
+        if self._bot_nickname:
+            nick = re.escape(self._bot_nickname)
+            text = re.sub(
+                rf"(?:@{nick}|{nick})[,\s]*",
+                " ", text, flags=re.IGNORECASE,
+            ).strip()
+        # Collapse any extra whitespace introduced by substitution
+        return re.sub(r" {2,}", " ", text).strip()
+
+    # ── DM invite handling ────────────────────────────────────────────────
+
+    async def _accept_dm_invites(self, invites: list) -> None:
+        """Auto-accept DM invites from allowed ships via chat-dm-rsvp poke."""
+        for invite in invites:
+            if not isinstance(invite, dict):
+                continue
+            ship = invite.get("ship", "").strip()
+            if not ship:
+                continue
+            if not ship.startswith("~"):
+                ship = f"~{ship}"
+            if not self._is_ship_allowed(ship):
+                logger.debug("Tlon: ignoring DM invite from %s (not in allowlist)", ship)
+                continue
+            try:
+                await self.client.poke(
+                    app="chat",
+                    mark="chat-dm-rsvp",
+                    poke_json={"ship": ship.lstrip("~"), "ok": True},
+                )
+                logger.info("Tlon: accepted DM invite from %s", ship)
+            except Exception as exc:
+                logger.warning("Tlon: failed to accept DM invite from %s: %s", ship, exc)
+
+    # ── Channel auto-discovery ────────────────────────────────────────────
+
+    async def _discover_channels(self) -> set:
+        """Scry /groups/v1/groups.json and return the set of chat/* nests."""
+        try:
+            groups = await self.client.scry("/groups/v1/groups.json")
+        except Exception as exc:
+            logger.warning("Tlon: channel auto-discovery failed: %s", exc)
+            return set()
+        if not isinstance(groups, dict):
+            return set()
+        nests: set = set()
+        for group_data in groups.values():
+            if not isinstance(group_data, dict):
+                continue
+            channels = group_data.get("channels", {})
+            if not isinstance(channels, dict):
+                continue
+            for nest in channels:
+                if nest.startswith("chat/") or nest.startswith("heap/"):
+                    nests.add(nest)
+        logger.info(
+            "Tlon: auto-discovered %d channel(s): %s",
+            len(nests), ", ".join(sorted(nests)) or "(none)",
+        )
+        return nests
+
+    # ── Image sending ─────────────────────────────────────────────────────
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "SendResult":
+        """Send an image as a Tlon story block.image verse.
+
+        image_url must be an http/https URL — Tlon has no file-upload API via
+        Eyre.  For local file paths the base-class fallback (URL as text) is
+        used instead.  Caption text (if any) is prepended as inline blocks.
+        """
+        from .urbit import text_to_story as _t2s
+
+        if not image_url.startswith(("http://", "https://")):
+            logger.warning(
+                "Tlon: send_image() only supports http/https URLs, got %r — "
+                "falling back to text", image_url,
+            )
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
+
+        story: list = []
+        if caption:
+            story.extend(_t2s(caption))
+        story.append({
+            "block": {
+                "image": {
+                    "src": image_url,
+                    "alt": caption or "",
+                    "width": 0,
+                    "height": 0,
+                }
+            }
+        })
+
+        if reply_to is None and isinstance(metadata, dict):
+            reply_to = metadata.get("thread_id") or None
+
+        try:
+            if chat_id.startswith("channel/"):
+                nest = chat_id.removeprefix("channel/")
+                msg_id = await self.client.send_channel_post(
+                    nest=nest, text="", story=story, reply_to=reply_to,
+                )
+            else:
+                bare = chat_id.removeprefix("club/").removeprefix("dm/").strip()
+                if bare.startswith("0v"):
+                    msg_id = await self.client.send_club_msg(
+                        club_id=bare, text="", story=story, reply_to=reply_to,
+                    )
+                else:
+                    target = bare if bare.startswith("~") else f"~{bare}"
+                    msg_id = await self.client.send_dm(
+                        to_ship=target, text="", story=story, reply_to=reply_to,
+                    )
+            return SendResult(success=True, message_id=msg_id)
+        except Exception as exc:
+            logger.error("Tlon: send_image failed to %s: %s", chat_id, exc)
+            return SendResult(success=False, error=str(exc))
 
     # ── Access control ────────────────────────────────────────────────────
 

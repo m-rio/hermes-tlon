@@ -22,7 +22,7 @@ import os
 import re
 import time
 import uuid
-from typing import AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import aiohttp
 
@@ -59,6 +59,21 @@ def format_ud(n: int) -> str:
         s = s[:-3]
     parts.append(s)
     return ".".join(reversed(parts))
+
+
+def ensure_ud_format(id_val: Any) -> str:
+    """Ensure a Tlon post ID is in dot-formatted @ud notation.
+
+    channel-action-2 decodes ``id`` fields with ``(se %ud)``, which requires
+    dot-separated thousands notation (e.g. "170.141.184.507.966.284.013…").
+    Inbound SSE events may deliver the same ID as a plain decimal string or
+    integer; strip dots first so we never double-format an already-correct ID.
+    """
+    try:
+        raw = str(id_val).strip().replace(".", "")
+        return format_ud(int(raw))
+    except (ValueError, TypeError):
+        return str(id_val)
 
 
 def make_msg_id(ship: str, sent_ms: int) -> str:
@@ -185,8 +200,9 @@ def text_to_story(text: str) -> list:
 def story_to_text(story: list) -> str:
     """Extract plain text from a Tlon story (list of verse objects).
 
-    Handles common inline types.  Unrecognised structures are skipped
-    silently so we don't crash on rich content.
+    Handles inline types (bold, italics, strike, code, link, ship, tag,
+    blockquote) and block verses (image, cite/quote, code block).
+    Unrecognised structures are skipped silently.
     """
     parts: list[str] = []
 
@@ -205,6 +221,9 @@ def story_to_text(story: list) -> str:
             return "".join(_inline(i) for i in node["italic"])
         if "strike" in node:
             return "".join(_inline(i) for i in node["strike"])
+        if "blockquote" in node:
+            inner = "".join(_inline(i) for i in node["blockquote"])
+            return f"> {inner}"
         # "inline-code" is the canonical Tlon key; "code" kept for compat
         if "inline-code" in node:
             return node["inline-code"]
@@ -214,11 +233,30 @@ def story_to_text(story: list) -> str:
             link = node["link"]
             return link.get("content", link.get("href", ""))
         if "ship" in node:
-            return node["ship"]
+            s = node["ship"]
+            return s if s.startswith("~") else f"~{s}"
         if "tag" in node:
             return f"#{node['tag']}"
         if "break" in node:
             return "\n"
+        return ""
+
+    def _block(b: dict) -> str:
+        """Extract text from a block-type verse value."""
+        if "image" in b:
+            img = b["image"]
+            alt = img.get("alt", "")
+            src = img.get("src", "")
+            return f"[image: {alt or src}]"
+        if "cite" in b:
+            return "[quoted message]"
+        if "code" in b:
+            code = b["code"]
+            if isinstance(code, dict):
+                lang = code.get("lang", "")
+                body = code.get("code", "")
+                return f"```{lang}\n{body}\n```"
+            return str(code)
         return ""
 
     for verse in story:
@@ -226,7 +264,12 @@ def story_to_text(story: list) -> str:
             continue
         if "inline" in verse:
             parts.append("".join(_inline(i) for i in verse["inline"]))
-        # block verses (images, code blocks, etc.) — ignored for plain text
+        elif "block" in verse:
+            b = verse["block"]
+            if isinstance(b, dict):
+                text = _block(b)
+                if text:
+                    parts.append(text)
 
     return "\n".join(parts)
 
@@ -410,6 +453,32 @@ class UrbitClient:
         return sub_id
 
     # ── Poke ─────────────────────────────────────────────────────────────
+
+    async def scry(self, path: str) -> Any:
+        """Scry a Gall agent path and return the parsed JSON response.
+
+        path: e.g. "/contacts/v1/self.json" or "/groups/v1/groups.json"
+        The auth cookie is sent automatically from the session cookie jar.
+        Appends ".json" suffix if the path doesn't already have it.
+        """
+        if not self._authenticated:
+            raise RuntimeError("Not authenticated — call authenticate() first")
+        session = await self._ensure_session()
+        full_path = path if path.endswith(".json") else f"{path}.json"
+        url = f"{self.ship_url}{full_path}"
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 404:
+                    raise FileNotFoundError(f"Scry path not found: {path}")
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"Scry failed: HTTP {resp.status} — {text[:200]}")
+                return await resp.json(content_type=None)
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"Scry request error: {exc}") from exc
 
     async def poke(self, app: str, mark: str, poke_json: object) -> int:
         """Send a poke to a Gall agent and return the poke_id."""
@@ -676,12 +745,15 @@ class UrbitClient:
         to_ship: str,
         text: str,
         reply_to: Optional[str] = None,
+        story: Optional[List] = None,
     ) -> str:
         """Send a plain-text DM to another Urbit ship.
 
-        to_ship: ship name with or without "~" (e.g. "~sampel-palnet")
-        text:    plain text message content
+        to_ship:  ship name with or without "~" (e.g. "~sampel-palnet")
+        text:     plain text message content (ignored when story is provided)
         reply_to: optional message ID to thread-reply to
+        story:    pre-built Tlon story (list of verse objects); when given,
+                  skips text_to_story() conversion (used by send_image())
 
         Returns a message_id string.
         Raises on auth or poke failure.
@@ -696,7 +768,7 @@ class UrbitClient:
             to_ship = f"~{to_ship}"
 
         sent_at = int(time.time() * 1000)  # ms since Unix epoch
-        story = text_to_story(text)
+        story = story if story is not None else text_to_story(text)
 
         # Full essay as expected by %chat agent (matches Tlon postsApi.ts sendPost)
         essay = {
@@ -765,12 +837,14 @@ class UrbitClient:
         club_id: str,
         text: str,
         reply_to: Optional[str] = None,
+        story: Optional[List] = None,
     ) -> str:
         """Send a message to a Tlon club (group DM / multi-DM).
 
         club_id:  club UUID, e.g. "0v3.abc12" (with or without leading "0v")
-        text:     message content (markdown supported)
+        text:     message content (markdown supported; ignored when story given)
         reply_to: optional message ID to thread-reply to
+        story:    pre-built Tlon story; when given, skips text_to_story()
 
         Returns a message_id string.
         Raises on auth or poke failure.
@@ -781,7 +855,7 @@ class UrbitClient:
                 raise RuntimeError("Tlon: authentication failed — cannot send club message")
 
         sent_at = int(time.time() * 1000)
-        story = text_to_story(text)
+        story = story if story is not None else text_to_story(text)
         msg_id = make_msg_id(self.ship, sent_at)
 
         essay = {
@@ -849,12 +923,14 @@ class UrbitClient:
         nest: str,
         text: str,
         reply_to: Optional[str] = None,
+        story: Optional[List] = None,
     ) -> str:
         """Send a message to a Tlon group channel.
 
         nest:     channel nest ID, e.g. "chat/~host/channel-name"
-        text:     message content (markdown supported)
+        text:     message content (markdown supported; ignored when story given)
         reply_to: optional parent post ID for thread replies
+        story:    pre-built Tlon story; when given, skips text_to_story()
 
         Returns a message_id string.
         Raises on auth or poke failure.
@@ -865,18 +941,19 @@ class UrbitClient:
                 raise RuntimeError("Tlon: authentication failed — cannot send channel post")
 
         sent_at = int(time.time() * 1000)
-        story = text_to_story(text)
+        story = story if story is not None else text_to_story(text)
         msg_id = make_msg_id(self.ship, sent_at)
 
         if reply_to:
-            # Thread reply inside a channel (PostActionReply)
+            # Thread reply inside a channel (PostActionReply).
+            # channel-action-2 decodes id with (se %ud) — must be dot-formatted @ud.
             channel_action_json = {
                 "channel": {
                     "nest": nest,
                     "action": {
                         "post": {
                             "reply": {
-                                "id": reply_to,
+                                "id": ensure_ud_format(reply_to),
                                 "action": {
                                     "add": {
                                         "reply-essay": {

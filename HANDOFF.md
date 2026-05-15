@@ -482,6 +482,11 @@ Priority order for "feels like a real Tlon client":
       `"italics"` bug was found and fixed in this session (see Known Issue #6).
 - [x] **Pre-authorize owner ship** — `owner_ship`, `allowed_users`, `allow_all_users`
       now read from config.yaml `extra` dict as fallbacks to env vars.
+- [x] **`@mention` filter for group channels** — `_is_bot_mentioned()` and
+      `_strip_bot_mention()` added to `adapter.py`. Bot nickname fetched on
+      `connect()` via `scry("/contacts/v1/self.json")`. Gate is on by default;
+      disable with `TLON_MENTION_GATE=0`.
+      ⚠️ **TEST NEEDED** — needs a live channel with another ship sending @mentions.
 
 ### P2 — Needed for group use
 - [x] **Group DMs (clubs)** — `0v…` chat IDs, `chat-club-action-2` poke implemented.
@@ -492,6 +497,10 @@ Priority order for "feels like a real Tlon client":
 - [x] **`TLON_HOME_CHANNEL` wired end-to-end** — `cron_deliver_env_var="TLON_HOME_CHANNEL"`
   registered in `ctx.register_platform()`, `_env_enablement()` seeds `home_channel` from
   the env var. When gateway is running, cron delivery routes to this channel automatically.
+- [x] **DM invite auto-accept** — `_accept_dm_invites()` added to `adapter.py`.
+  Detects list payload in `_on_dm_event()`, sends `chat-dm-rsvp` poke for each
+  allowed ship. Gated by `_is_ship_allowed()`.
+  ⚠️ **TEST NEEDED** — needs a fresh ship that hasn't DM'd the bot before.
 
 ### P3 — Full feature parity
 - [x] **Group channels** — subscribe `app=channels, path=/v4`; send via `channel-action-2`
@@ -499,6 +508,32 @@ Priority order for "feels like a real Tlon client":
   - Outbound: `send_channel_post()` in `urbit.py` + routing in `send()` (`"channel/nest"`)
   - Thread replies in channels also supported via `"post": { "reply": {...} }` action
   - **⚠️ TEST NEEDED** — no live channel test run yet (see Test 6 in Testing section)
+- [x] **`send_image()` method** — Implemented in `adapter.py`. Builds a
+  `block.image` story verse (with optional caption inline blocks prepended).
+  Routes through `send_dm` / `send_club_msg` / `send_channel_post` via the new
+  `story=` kwarg on each method. Falls back to base-class text for non-URL paths.
+  `send_dm`, `send_club_msg`, `send_channel_post` in `urbit.py` all accept an
+  optional `story: Optional[List]` kwarg that bypasses `text_to_story()`.
+  ⚠️ **TEST NEEDED** — needs a live http/https image URL to send.
+- [x] **`TLON_AUTO_DISCOVER`** — `_discover_channels()` added to `adapter.py`.
+  Called in `connect()` when `TLON_AUTO_DISCOVER=1`. Scries `/groups/v1/groups.json`
+  via new `UrbitClient.scry()` method in `urbit.py`. Adds `chat/*` and `heap/*`
+  nests to `_channel_filter`. `scry()` is also used for nickname fetch.
+  ⚠️ **TEST NEEDED** — scry path may differ on some ship versions (`/groups/v2/`);
+  test against live ship before relying on this.
+- [x] **Standalone cron delivery** — `_send_tlon()` implemented in
+  `send_message_tool.py` with `elif platform == Platform("tlon"):` dispatch.
+  Uses correct marks (`chat-dm-action-2`, `channel-action-2`) and the `@da` ID
+  formula inlined. Works whether or not the gateway is running.
+  ⚠️ **TEST NEEDED** — run a cron job with `TLON_HOME_CHANNEL` set and the gateway
+  NOT running to confirm one-shot delivery works end-to-end.
+- [x] **Inbound `blockquote` / `cite` / code-block parsing** — `story_to_text()`
+  in `urbit.py` now handles:
+  - `{"blockquote": [...]}` inline → `"> <text>"`
+  - `{"block": {"cite": {...}}}` block verse → `"[quoted message]"`
+  - `{"block": {"code": {"lang": ..., "code": ...}}}` → `` "```lang\nbody\n```" ``
+  - `{"block": {"image": {...}}}` → `"[image: alt or src]"`
+  - `{"ship": "..."}` inline now always includes the `~` prefix
 - [ ] **Receive reactions** — `add-react` delta in WritResponse (currently ignored)
 - [ ] **Message deletion notice** — `del` delta (currently ignored)
 
@@ -519,23 +554,35 @@ gateway adapter for the Hermes Agent. The plugin is at:
     plugin.yaml  — env var config
     HANDOFF.md   — full technical handoff (READ THIS FIRST)
 
-Current state: All P1 + P2 + P3 (group channels) items done. DMs, clubs, and group
-  channels all implemented. Config.yaml `extra.owner_ship` works. TLON_HOME_CHANNEL
-  wired for cron. All P1 bugs fixed: `%quit`, `_ACK_THRESHOLD=1`, `"italics"` key.
+Current state: All P1 + P2 + P3 items implemented. Full feature set:
+  - DMs, clubs (group DMs), group channels — send + receive
+  - @mention gate for channels (TLON_MENTION_GATE=0 to disable)
+  - DM invite auto-accept (chat-dm-rsvp)
+  - send_image() with story block.image verses
+  - TLON_AUTO_DISCOVER=1 for zero-config channel discovery
+  - Standalone cron delivery in send_message_tool.py
+  - story_to_text(): blockquote, cite, code-block, image block verses
+  - Config.yaml extra.owner_ship works; TLON_HOME_CHANNEL wired for cron
+  - All reliability fixes: %quit handler, _ACK_THRESHOLD=1, "italics" key
 Live test ship: ~tichul-tiprum-sigmes-modfyn at http://104.219.236.151:8080
 
 Read HANDOFF.md fully before touching any code. It contains the exact Urbit API 
 formats, the hard-won ID formula, the prioritized gap list, and the Testing section.
 
-⚠️  Tests still needed:
-    - Test 3: `%quit` resubscription (requires dojo access)
+⚠️  Tests still needed (code written, not yet live-verified):
+    - Test 3: %quit resubscription (requires dojo access)
     - Test 4: soak test (~3 hours)
     - Test 5: club send/receive (needs a real club)
     - Test 6: channel receive + send (needs TLON_CHANNELS set + a real channel)
+    - Test 7: @mention gate — channel post ignored without mention, answered with
+    - Test 8: DM invite auto-accept — fresh ship DMs bot for the first time
+    - Test 9: send_image() — AI sends an http image URL to a DM or channel
+    - Test 10: TLON_AUTO_DISCOVER=1 — bot joins channels without TLON_CHANNELS set
+    - Test 11: standalone cron — cron job fires with gateway NOT running
 
-Remaining P3 items (low priority):
-1. Receive reactions — `add-react` delta in WritResponse (currently ignored)
-2. Message deletion notice — `del` delta (currently ignored)
+Remaining low-priority items:
+  - Receive reactions (add-react delta in WritResponse)
+  - Message deletion notice (del delta)
 
 The reference source for all Tlon API shapes is:
   https://github.com/tloncorp/tlon-apps (branch: develop)

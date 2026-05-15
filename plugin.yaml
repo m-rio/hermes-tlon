@@ -18,7 +18,10 @@ requires_env:
     password: true
 optional_env:
   - name: TLON_HOME_CHANNEL
-    description: "Default channel for cron delivery (e.g. ~host-ship/channel-name)"
+    description: "Default channel for cron delivery (e.g. chat/~host/channel-name)"
+    password: false
+  - name: TLON_CHANNELS
+    description: "Comma-separated channel nests to monitor, or * for all (e.g. chat/~host/name)"
     password: false
   - name: TLON_OWNER_SHIP
     description: "Owner ship always allowed — receives approval DMs (e.g. ~your-main-ship)"
@@ -28,4 +31,10 @@ optional_env:
     password: false
   - name: TLON_ALLOW_ALL_USERS
     description: "Set to 1 to allow all ships to DM the bot"
+    password: false
+  - name: TLON_MENTION_GATE
+    description: "Set to 0 to respond to ALL channel messages (default: 1 = @mention required)"
+    password: false
+  - name: TLON_AUTO_DISCOVER
+    description: "Set to 1 to auto-discover group channels via /groups scry"
     password: false
