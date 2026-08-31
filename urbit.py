@@ -457,19 +457,23 @@ class UrbitClient:
     async def scry(self, path: str) -> Any:
         """Scry a Gall agent path and return the parsed JSON response.
 
-        path: e.g. "/contacts/v1/self.json" or "/groups/v1/groups.json"
+        path: e.g. "/contacts/v1/self" or "/groups/v1/groups"
         The auth cookie is sent automatically from the session cookie jar.
         Appends ".json" suffix if the path doesn't already have it.
+        Uses the Eyre scry endpoint /~/scry/{path}.json.
         """
         if not self._authenticated:
             raise RuntimeError("Not authenticated — call authenticate() first")
         session = await self._ensure_session()
         full_path = path if path.endswith(".json") else f"{path}.json"
-        url = f"{self.ship_url}{full_path}"
+        # Eyre scry endpoint requires /~/scry/ prefix; without it, requests
+        # hit the general HTTP handler and get redirected to Landscape HTML.
+        url = f"{self.ship_url}/~/scry{full_path}"
         try:
             async with session.get(
                 url,
                 timeout=aiohttp.ClientTimeout(total=30),
+                allow_redirects=False,
             ) as resp:
                 if resp.status == 404:
                     raise FileNotFoundError(f"Scry path not found: {path}")
@@ -995,6 +999,65 @@ class UrbitClient:
         await self.poke("channels", "channel-action-2", channel_action_json)
         logger.info("Tlon: channel post sent to %s (msg %s)", nest, msg_id)
         return msg_id
+
+    # ── Channel history (scry) ───────────────────────────────────────────
+
+    async def fetch_channel_history(
+        self, nest: str, count: int = 20
+    ) -> list[dict]:
+        """Scry recent channel posts for group dispatch context.
+
+        Returns a list of dicts with keys: author, text, sent, id — oldest
+        first, newest last. Uses the /channels/v4 scry surface (same as
+        OpenClaw and the official Tlon adapter).
+        """
+        if count <= 0:
+            return []
+        try:
+            payload = await self.scry(
+                f"/channels/v4/{nest}/posts/newest/{count}/outline"
+            )
+        except Exception as exc:
+            logger.debug("Tlon: channel history scry failed for %s: %s", nest, exc)
+            return []
+
+        if not isinstance(payload, list):
+            return []
+
+        entries: list[dict] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            # Outline posts have shape: {"post": {"id": ..., "essay": {...}}}
+            post = item.get("post", item)
+            essay = post.get("essay") or post
+            if not isinstance(essay, dict):
+                continue
+            author = essay.get("author", "")
+            if isinstance(author, dict):
+                author = author.get("ship", "")
+            author = str(author).strip()
+            if author and not author.startswith("~"):
+                author = f"~{author}"
+            content = essay.get("content", [])
+            text = story_to_text(content) if isinstance(content, list) else str(content)
+            if not text.strip():
+                continue
+            try:
+                sent = float(essay.get("sent") or 0)
+            except (TypeError, ValueError):
+                sent = 0.0
+            post_id = str(post.get("id") or "")
+            entries.append({
+                "author": author,
+                "text": text,
+                "sent": sent,
+                "id": post_id,
+            })
+
+        # Scry returns newest-first; reverse for chronological order
+        entries.reverse()
+        return entries
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 

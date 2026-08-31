@@ -94,6 +94,8 @@ class TlonPlatformAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("tlon"))
 
         extra = getattr(config, "extra", {}) or {}
+        _hc = getattr(config, "home_channel", None)
+        logger.info("Tlon: init — config.home_channel=%s, extra keys=%s", _hc, list(extra.keys()))
 
         # Connection settings — env vars take precedence over config.yaml
         self.ship_url: str = (
@@ -138,6 +140,60 @@ class TlonPlatformAdapter(BasePlatformAdapter):
         auto_disc_raw = os.getenv("TLON_AUTO_DISCOVER") or str(extra.get("auto_discover", ""))
         self._auto_discover: bool = auto_disc_raw.strip() in ("1", "true", "yes")
 
+        # Thread reply behavior:
+        #   - When False (default): reply top-level to top-level msgs, in-thread to thread msgs
+        #   - When True: always start a thread on the triggering message for group replies
+        self._reply_in_thread: bool = (
+            os.getenv("TLON_REPLY_IN_THREAD", "0").strip() in ("1", "true", "yes")
+        )
+
+        # Owner-listen: owner is heard without @mention in group channels.
+        # Default True (matches official Tlon adapter). Per-channel overrides below.
+        self._owner_listen: bool = (
+            os.getenv("TLON_OWNER_LISTEN", "1").strip() not in ("0", "false", "no")
+        )
+        raw_ol_disabled = os.getenv("TLON_OWNER_LISTEN_DISABLED_CHANNELS", "")
+        self._owner_listen_disabled: set[str] = {
+            c.strip() for c in raw_ol_disabled.split(",") if c.strip()
+        }
+        raw_ol_enabled = os.getenv("TLON_OWNER_LISTEN_ENABLED_CHANNELS", "")
+        self._owner_listen_enabled: set[str] = {
+            c.strip() for c in raw_ol_enabled.split(",") if c.strip()
+        }
+
+        # Free-response channels: no @mention required for any allowed user
+        raw_free = os.getenv("TLON_FREE_RESPONSE_CHANNELS", "")
+        self._free_response_channels: set[str] = {
+            c.strip() for c in raw_free.split(",") if c.strip()
+        }
+
+        # Group dispatch context: number of recent channel messages to prepend
+        # as context (0 disables). Default 20 (matches official adapter).
+        ctx_raw = os.getenv("TLON_CONTEXT_MESSAGES", "20").strip()
+        try:
+            self._context_messages: int = max(0, int(ctx_raw))
+        except ValueError:
+            self._context_messages = 20
+
+        # Loop protection: known bot ships and max consecutive responses
+        raw_known_bots = os.getenv("TLON_KNOWN_BOT_USERS", "")
+        self._known_bot_users: set[str] = {
+            s.strip() for s in raw_known_bots.split(",") if s.strip()
+        }
+        max_bot_raw = os.getenv("TLON_MAX_CONSECUTIVE_BOT_RESPONSES", "2").strip()
+        try:
+            self._max_consecutive_bot_responses: int = max(1, int(max_bot_raw))
+        except ValueError:
+            self._max_consecutive_bot_responses = 2
+        # Per-channel consecutive bot dispatch counter: {nest: {ship: count}}
+        self._bot_response_counts: Dict[str, Dict[str, int]] = {}
+
+        # Last incoming message ID per chat_id, for TLON_REPLY_IN_THREAD support.
+        # The gateway passes metadata=None for top-level (non-thread) messages,
+        # so we can't rely on metadata to carry trigger_message_id. Instead we
+        # remember the last inbound msg_id per chat_id and look it up in send().
+        self._last_trigger_msg_id: Dict[str, str] = {}
+
         self.client = UrbitClient(
             ship_url=self.ship_url,
             ship=self.ship,
@@ -151,7 +207,7 @@ class TlonPlatformAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Authenticate, open an Urbit SSE channel, and subscribe to DMs."""
         if not self.ship_url or not self.login_code:
             logger.error(
@@ -258,9 +314,32 @@ class TlonPlatformAdapter(BasePlatformAdapter):
         # Tlon clients can't send "/command" — rewrite approval hints in text
         content = _strip_slashes_for_tlon(content)
 
-        # Use thread_id from metadata as reply_to when the gateway provides it
-        if reply_to is None and isinstance(metadata, dict):
-            reply_to = metadata.get("thread_id") or None
+        # ── Thread reply resolution ──
+        # The gateway's _reply_anchor_for_event() returns event.message_id for
+        # all non-Telegram/Feishu platforms, so reply_to is almost never None.
+        # We need to override that behaviour to match Tlon's thread semantics:
+        #
+        #   - If metadata carries thread_id → the incoming message was in a
+        #     thread → reply in that thread (mirror behaviour).
+        #   - If TLON_REPLY_IN_THREAD=true → always start a thread on the
+        #     triggering message (use the in-memory map as fallback).
+        #   - Otherwise → top-level reply: clear the gateway-provided reply_to
+        #     so Tlon sends a standalone message, not a thread reply.
+        thread_id = None
+        if isinstance(metadata, dict):
+            thread_id = metadata.get("thread_id") or None
+
+        if thread_id:
+            # Incoming message was in a thread → reply in-thread
+            reply_to = thread_id
+        elif self._reply_in_thread:
+            # Force thread replies on all messages
+            trigger_msg_id = self._last_trigger_msg_id.get(chat_id)
+            if trigger_msg_id:
+                reply_to = trigger_msg_id
+        else:
+            # Top-level reply — clear the gateway-provided reply_to
+            reply_to = None
 
         # --- Group channel ---
         if chat_id.startswith("channel/"):
@@ -356,6 +435,10 @@ class TlonPlatformAdapter(BasePlatformAdapter):
         if not isinstance(response, dict):
             return
 
+        # Debug: log the raw event structure for thread reply diagnosis
+        _resp_keys = list(response.keys())
+        logger.debug("Tlon: DM event keys=%s whom=%s id=%s", _resp_keys, whom, payload.get("id"))
+
         # --- top-level message ("add") ---
         add = response.get("add")
         if isinstance(add, dict):
@@ -387,6 +470,8 @@ class TlonPlatformAdapter(BasePlatformAdapter):
 
         # --- other deltas (reactions, deletions, etc.) — ignore ---
         else:
+            logger.debug("Tlon: ignoring DM event (keys=%s)",
+                         list(response.keys()) if isinstance(response, dict) else type(response).__name__)
             return
 
         # Normalise author ship
@@ -432,6 +517,12 @@ class TlonPlatformAdapter(BasePlatformAdapter):
 
         # thread_root_id is set for thread replies (None for top-level messages)
         _thread_root_id = locals().get("_thread_root_id")
+
+        # Remember the trigger message ID for TLON_REPLY_IN_THREAD support.
+        # Only stored for top-level messages (thread replies already carry
+        # thread_id through metadata, so they don't need this fallback).
+        if not _thread_root_id:
+            self._last_trigger_msg_id[chat_id] = str(msg_id)
 
         source = self.build_source(
             chat_id=chat_id,
@@ -572,8 +663,47 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             logger.info("Tlon: channel post from %s blocked (not in allowlist)", author)
             return
 
-        # Mention gate — only respond when the bot is addressed
-        if self._mention_gate and not self._is_bot_mentioned(text):
+        # ── Loop protection: drop known bots after N consecutive responses ──
+        is_known_bot = author in self._known_bot_users
+        if is_known_bot:
+            counts = self._bot_response_counts.setdefault(nest, {})
+            count = counts.get(author, 0)
+            if count >= self._max_consecutive_bot_responses:
+                logger.info(
+                    "Tlon: dropping %s in %s (loop protection: %d consecutive)",
+                    author, nest, count,
+                )
+                return
+            counts[author] = count + 1
+        else:
+            # Non-bot user reset the consecutive counter for all bots in this channel
+            if nest in self._bot_response_counts:
+                self._bot_response_counts[nest].clear()
+
+        # ── Mention gate with owner-listen and free-response bypass ──
+        mention_required = self._mention_gate
+        if mention_required:
+            # Free-response channels: no mention required for any allowed user
+            if nest in self._free_response_channels:
+                mention_required = False
+            # Owner-listen: owner heard without mention unless channel is muted
+            elif (
+                self._owner_listen
+                and self._owner_ship
+                and author == self._owner_ship
+                and nest not in self._owner_listen_disabled
+            ):
+                mention_required = False
+            # Owner-listen opt-in for non-owned channels
+            elif (
+                self._owner_listen
+                and self._owner_ship
+                and author == self._owner_ship
+                and nest in self._owner_listen_enabled
+            ):
+                mention_required = False
+
+        if mention_required and not self._is_bot_mentioned(text):
             logger.debug(
                 "Tlon: channel post from %s in %s ignored (bot not mentioned)", author, nest
             )
@@ -585,6 +715,10 @@ class TlonPlatformAdapter(BasePlatformAdapter):
 
         chat_id = f"channel/{nest}"
         logger.info("Tlon: inbound channel post from %s in %s: %r", author, nest, text[:80])
+
+        # Remember the trigger message ID for TLON_REPLY_IN_THREAD support.
+        if not thread_root_id:
+            self._last_trigger_msg_id[chat_id] = str(msg_id)
 
         source = self.build_source(
             chat_id=chat_id,
@@ -603,7 +737,7 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             timestamp=datetime.datetime.now(),
         )
 
-        asyncio.create_task(self._dispatch(event))
+        asyncio.create_task(self._dispatch_channel(event, nest, str(msg_id)))
 
     async def _dispatch(self, event: MessageEvent) -> None:
         """Hand the event to the base-class handler (runs in event loop)."""
@@ -611,6 +745,42 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             await self.handle_message(event)
         except Exception as exc:
             logger.exception("Tlon: error dispatching message event: %s", exc)
+
+    async def _dispatch_channel(
+        self, event: MessageEvent, nest: str, trigger_msg_id: str
+    ) -> None:
+        """Dispatch a channel event, prepending recent history as context."""
+        if self._context_messages > 0:
+            try:
+                history = await self.client.fetch_channel_history(
+                    nest, self._context_messages
+                )
+                if history:
+                    lines: list[str] = []
+                    for entry in history:
+                        eid = entry.get("id", "")
+                        # Skip the triggering message itself
+                        if eid and eid.replace(".", "") == trigger_msg_id.replace(".", ""):
+                            continue
+                        # Skip our own messages
+                        if entry.get("author") == self.ship:
+                            continue
+                        author = entry.get("author", "unknown")
+                        text_line = entry.get("text", "").strip()
+                        if text_line:
+                            lines.append(f"[{author}]: {text_line}")
+                    if lines:
+                        event.channel_context = "\n".join(lines)
+                        logger.debug(
+                            "Tlon: prepended %d context messages for %s",
+                            len(lines), nest,
+                        )
+            except Exception as exc:
+                logger.debug("Tlon: failed to fetch channel context: %s", exc)
+        try:
+            await self.handle_message(event)
+        except Exception as exc:
+            logger.exception("Tlon: error dispatching channel event: %s", exc)
 
     # ── Mention detection ─────────────────────────────────────────────────
 
@@ -732,8 +902,18 @@ class TlonPlatformAdapter(BasePlatformAdapter):
             }
         })
 
-        if reply_to is None and isinstance(metadata, dict):
-            reply_to = metadata.get("thread_id") or None
+        # Thread reply resolution (same logic as send())
+        thread_id = None
+        if isinstance(metadata, dict):
+            thread_id = metadata.get("thread_id") or None
+        if thread_id:
+            reply_to = thread_id
+        elif self._reply_in_thread:
+            trigger_msg_id = self._last_trigger_msg_id.get(chat_id)
+            if trigger_msg_id:
+                reply_to = trigger_msg_id
+        else:
+            reply_to = None
 
         try:
             if chat_id.startswith("channel/"):
@@ -778,7 +958,9 @@ class TlonPlatformAdapter(BasePlatformAdapter):
 def check_requirements() -> bool:
     """Return True when the minimum required env vars are set."""
     return bool(
-        os.getenv("TLON_SHIP_URL") and os.getenv("TLON_LOGIN_CODE")
+        os.getenv("TLON_SHIP_URL")
+        and os.getenv("TLON_LOGIN_CODE")
+        and os.getenv("TLON_OWNER_SHIP")
     )
 
 
@@ -787,7 +969,8 @@ def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     ship_url = os.getenv("TLON_SHIP_URL") or extra.get("ship_url", "")
     login_code = os.getenv("TLON_LOGIN_CODE") or extra.get("login_code", "")
-    return bool(ship_url and login_code)
+    owner = os.getenv("TLON_OWNER_SHIP") or extra.get("owner_ship", "")
+    return bool(ship_url and login_code and owner)
 
 
 def _env_enablement() -> Optional[dict]:
@@ -804,6 +987,17 @@ def _env_enablement() -> Optional[dict]:
         seed["ship"] = ship
 
     home_channel = os.getenv("TLON_HOME_CHANNEL", "").strip()
+    if not home_channel:
+        # Default home channel to the owner ship DM so Hermes core always has
+        # a cron delivery target and never nags about /home setup.
+        owner = os.getenv("TLON_OWNER_SHIP", "").strip()
+        if owner:
+            home_channel = owner
+            # Also set the env var because the gateway's "No home channel"
+            # check (run.py ~line 10785) reads os.getenv() directly, not
+            # config.get_home_channel(). Without this, the nag fires even
+            # though PlatformConfig.home_channel is correctly set.
+            os.environ["TLON_HOME_CHANNEL"] = owner
     if home_channel:
         seed["home_channel"] = {"chat_id": home_channel, "name": "Home"}
 
@@ -819,7 +1013,7 @@ def register(ctx):
         check_fn=check_requirements,
         validate_config=validate_config,
         env_enablement_fn=_env_enablement,
-        required_env=["TLON_SHIP_URL", "TLON_LOGIN_CODE"],
+        required_env=["TLON_SHIP_URL", "TLON_LOGIN_CODE", "TLON_OWNER_SHIP"],
         cron_deliver_env_var="TLON_HOME_CHANNEL",
         allowed_users_env="TLON_ALLOWED_USERS",
         allow_all_env="TLON_ALLOW_ALL_USERS",

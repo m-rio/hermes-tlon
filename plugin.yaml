@@ -1,7 +1,7 @@
 name: hermes-tlon
 label: Tlon
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: Tlon/Urbit messenger gateway adapter
 requires_env:
   - name: TLON_SHIP_URL
@@ -16,15 +16,16 @@ requires_env:
     description: "Login code for the Tlon ship (e.g. lidlut-tabwed-pillex-ridrup)"
     prompt: "Login code"
     password: true
+  - name: TLON_OWNER_SHIP
+    description: "Owner ship — always allowed, receives approval DMs, anchors home channel default (e.g. ~your-main-ship)"
+    prompt: "Owner ship"
+    password: false
 optional_env:
   - name: TLON_HOME_CHANNEL
-    description: "Default channel for cron delivery (e.g. chat/~host/channel-name)"
+    description: "Default channel for cron delivery; defaults to TLON_OWNER_SHIP DM (e.g. chat/~host/channel-name)"
     password: false
   - name: TLON_CHANNELS
     description: "Comma-separated channel nests to monitor, or * for all (e.g. chat/~host/name)"
-    password: false
-  - name: TLON_OWNER_SHIP
-    description: "Owner ship always allowed — receives approval DMs (e.g. ~your-main-ship)"
     password: false
   - name: TLON_ALLOWED_USERS
     description: "Comma-separated list of ships allowed to DM the bot"
@@ -37,4 +38,28 @@ optional_env:
     password: false
   - name: TLON_AUTO_DISCOVER
     description: "Set to 1 to auto-discover group channels via /groups scry"
+    password: false
+  - name: TLON_REPLY_IN_THREAD
+    description: "Set to 1 to always reply in a thread on the triggering message (default: 0 = mirror incoming thread status)"
+    password: false
+  - name: TLON_OWNER_LISTEN
+    description: "Hear owner without @mention in group channels (default: 1 = true)"
+    password: false
+  - name: TLON_OWNER_LISTEN_DISABLED_CHANNELS
+    description: "Comma-separated channel nests muted for owner-listen"
+    password: false
+  - name: TLON_OWNER_LISTEN_ENABLED_CHANNELS
+    description: "Comma-separated non-owned channel nests opted into owner-listen"
+    password: false
+  - name: TLON_FREE_RESPONSE_CHANNELS
+    description: "Comma-separated channel nests where any allowed user can trigger replies without @mention"
+    password: false
+  - name: TLON_CONTEXT_MESSAGES
+    description: "Recent channel messages prepended as context on group dispatch (default: 20, 0 disables)"
+    password: false
+  - name: TLON_KNOWN_BOT_USERS
+    description: "Comma-separated bot ships subject to group-channel loop protection"
+    password: false
+  - name: TLON_MAX_CONSECUTIVE_BOT_RESPONSES
+    description: "Max consecutive group dispatch attempts from known bot ships before dropping (default: 2)"
     password: false
